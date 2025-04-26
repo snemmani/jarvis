@@ -4,7 +4,7 @@ from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 
 # Globals
-ALLOWED_USERS = [os.environ["TELEGRAM_USER_ID"]]
+ALLOWED_USERS = [int(os.environ["TELEGRAM_USER_ID"])]
 COHERE_MODEL = "command-a-03-2025"
 NOCODB_BASE_URL = "https://app.nocodb.com"
 

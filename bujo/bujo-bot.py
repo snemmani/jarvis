@@ -1,7 +1,9 @@
+from ast import mod
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model
+from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model
 from bujo.expenses.manage import ADD_EXPENSE_CHAT, LIST_EXPENSE_CHAT, ExpenseManager
+from bujo.mag.manage import UPDATE_MAG, LIST_MAG_CHAT, MagManager
 import requests
 
 
@@ -33,7 +35,9 @@ async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     expense_manager = ExpenseManager(expenses_model)
-    conv_handler = ConversationHandler(
+    mag_manager = MagManager(mag_model)
+
+    expense_add_handler = ConversationHandler(
         entry_points=[CommandHandler("add_expenses", expense_manager.start_add)],
         states={
             ADD_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_expense_input)]
@@ -41,7 +45,7 @@ if __name__ == '__main__':
         fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
     )
 
-    conv_handler_2 = ConversationHandler(
+    expenses_list_handler = ConversationHandler(
         entry_points=[CommandHandler("list_expenses", expense_manager.start_list)],
         states={
             LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_list_input)]
@@ -49,10 +53,28 @@ if __name__ == '__main__':
         fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
     )
 
+    modify_mag_handler = ConversationHandler(
+        entry_points=[CommandHandler("update_mag", mag_manager.start_modify)],
+        states={
+            UPDATE_MAG: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_mag_change)]
+        },
+        fallbacks=[CommandHandler("cancel", mag_manager.cancel)],
+    )
+
+    mag_list_handler = ConversationHandler(
+        entry_points=[CommandHandler("list_mag", mag_manager.start_list)],
+        states={
+            LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_list_input)]
+        },
+        fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ipv6", reveal_my_ipv6))
-    app.add_handler(conv_handler)
-    app.add_handler(conv_handler_2)
+    app.add_handler(expense_add_handler)
+    app.add_handler(expenses_list_handler)
+    app.add_handler(modify_mag_handler)
+    app.add_handler(mag_list_handler)
 
     print("🤖 Bot is running...")
     app.run_polling()

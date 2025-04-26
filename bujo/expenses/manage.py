@@ -4,6 +4,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 from datetime import datetime
 import json
 from bujo.models.expenses import Expenses
+import litellm
 from bujo.base import ALLOWED_USERS, COHERE_MODEL, cohere_client
 
 
@@ -24,7 +25,7 @@ class ExpenseManager:
         ]
 
         self.messages_list = [
-            {'role': 'system', 'content': f"""## LLM ROLE: You are an expert freetext to python serializer and my personal interpretor. There are following fields in expenses schema: Date, Item, Amount. ##\n## INSTRUCTION: You have 1 roles as a part of this exercise  ##\n## INSTRUCTION: When I say ACT_AS_DATE_HELPER, you will take the input from me and then convert my query to a nocodb filter condition   ##\n## INSTRUCTION: Remember that today's date is {today}\n## ACT_AS_DATE_HELPER Instruction: For example, if I asked Get me expenses from the month of march 2025, you will respond with ["(Date,ge,exactDate,2025-03-1)", "(Date,lt,exactDate,2025-04-01)"] ##\n## ACT_AS_DATE_HELPER Instruction: Another example, if I asked Get me expenses from last month, you would check which month last month is, then give me a condition like ["(Date,ge,exactDate,2025-03-01)", "(Date,lt,exactDate,2025-04-01)"]" ##\n## ACT_AS_DATE_HELPER Instruction: Another example, if I asked Get me expenses for a specific day ex. 2025-01-01, then you will provide the filter as ["(Date,eq,exactDate,2025-01-01)"] ##\n## ACT_AS_DATE_HELPER Instruction: You will respond with the Filter query only and nothing else ##\n## INSTRUCTION: If the user asks about a date from future, in any way, keep the end date as today or exact date as today. ##\n"""}
+            {'role': 'system', 'content': f"""LLM ROLE: You are an expert freetext to python serializer and my personal interpretor. There are following fields in expenses schema: Date, Item, Amount.\nINSTRUCTION: You have 1 roles as a part of this exercise\nINSTRUCTION: You will take the input from me and then convert my query to a nocodb filter condition\nINSTRUCTION: Remember that today's date is {today}\nINSTRUCTION Instruction: For example, if I asked Get me expenses from the month of march 2025, you will respond with ["(Date,ge,exactDate,2025-03-1)", "(Date,lt,exactDate,2025-04-01)"]\nINSTRUCTION Instruction: Another example, if I asked Get me expenses from last month, you would check which month last month is, then give me a condition like ["(Date,ge,exactDate,2025-03-01)", "(Date,lt,exactDate,2025-04-01)"]"\nINSTRUCTION Instruction: Another example, if I asked Get me expenses for a specific day ex. 2025-01-01, then you will provide the filter as ["(Date,eq,exactDate,2025-01-01)"]\nINSTRUCTION Instruction: You will respond with the Date Filter query only and nothing else, even if the user asks for summary by groceries or any other item. You will respond with date filters only!. This is the MOST IMPORTANT INSTRUCTION\nINSTRUCTION: If the user asks about a date from future, in any way, keep the end date as today or exact date as today."""}
         ]
 
     async def start_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,14 +104,15 @@ class ExpenseManager:
         messages_copy = self.messages_list.copy()
         messages_copy.append({'role': 'user', 'content': text})
 
-        gen_ai_response = cohere_client.chat(
-            model=COHERE_MODEL, 
-            messages = messages_copy
+        gen_ai_response = litellm.completion(
+            model="ollama/phi4:latest",
+            messages = messages_copy,
+            api_base="http://localhost:10000"
         )
 
         # Parse the input to determine if it's a month or a specific day
         try:
-            payload = json.loads(gen_ai_response.message.content[0].text.replace('```json', '').replace('```', ''))
+            payload = json.loads(gen_ai_response.choices[0].message.content.replace('```json', '').replace('```', ''))
             expenses = self.expenses_model.list(where=payload)
 
             if not expenses:
@@ -128,40 +130,22 @@ class ExpenseManager:
             for expense in expenses
         ]
         summary_prompt = (
-            f"Summarize the following expenses data by Date and Category for the specified period: {payload}.\n ## INSTRUCTION: Currency is always in Indian Rupees with Symbol '₹'\n" +
+            f"{text}.\nThe expenses data is in the below json payload.\n {payload}.\n ## INSTRUCTION: Currency is always in Indian Rupees with Symbol '₹'\n" +
             "\n".join(expense_texts)
         )
-        gen_ai_response = cohere_client.chat(
-            model=COHERE_MODEL, 
-            messages=[{'role': 'user', 'content': summary_prompt}]
+
+        gen_ai_response = litellm.completion(
+            model="ollama/phi4:latest",
+            messages=[{'role': 'user', 'content': summary_prompt}],
+            api_base="http://localhost:10000"
         )
 
-        summary = gen_ai_response.message.content[0].text.strip()
+        summary = gen_ai_response.choices[0].message.content
 
         await update.message.reply_text(
             f"📋 Expenses Summary:\n\n{summary}",
             parse_mode='markdown'
         )
         return LIST_EXPENSE_CHAT
-
-
-
-
-
-
-
-# NocoDB config (replace with actual values or import from settings file)
-
-
-
-
-# Allowed user IDs
-
-
-
-
-
-
-
-
+    
     
