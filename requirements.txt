@@ -1,3 +1,7 @@
 python-telegram-bot==22.0
 requests
 cohere
+langchain
+langchain_community
+dotenv
+langchain-cohere

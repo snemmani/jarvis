@@ -1,19 +1,69 @@
 from ast import mod
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model
-from bujo.expenses.manage import ADD_EXPENSE_CHAT, LIST_EXPENSE_CHAT, ExpenseManager
-from bujo.mag.manage import UPDATE_MAG, LIST_MAG_CHAT, MagManager
+from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY
+from bujo.expenses.manage import ExpenseManager
+from bujo.mag.manage import MagManager
+from langchain.memory import ConversationBufferMemory
 import requests
+from langchain.agents import initialize_agent, Tool
+from datetime import datetime
+
+SYSTEM_PROMPT = [
+    "You are an expert personal assistant that helps me manage my finances and a calender (which I call MAG).",
+    "Depending upon my request you will interact with the specific tool, either Expenses tool or MAG tool or Search the Web."
+]
+
+def prepend_system_prompt(user_input: str) -> str:
+    return f"{SYSTEM_PROMPT}\n\nUser: {user_input}"
+
+expense_manager = ExpenseManager(expenses_model, mag_model)
+mag_manager = MagManager(mag_model)
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+tools = [
+    Tool(
+        name="Expenses Interaction",
+        func=expense_manager.agent_expenses,
+        description="Use this tool to fetch expenses based on specific filters."
+    ),
+    Tool(
+        name="MAG interaction",
+        func=mag_manager.agent_mag,
+        description="Use this tool to manage MAG."
+    ),
+    Tool(
+        name="Search the Web",
+        func=lambda query: requests.get(f"https://serpapi.com/search", params={"q": query, "api_key": SERP_API_KEY}).json(),
+        description="Use this tool to search the web for information based on the user's query."
+    )
+]
+
+agent = initialize_agent(
+    tools=tools, 
+    llm=llm, 
+    agent="chat-conversational-react-description", 
+    memory=memory,
+    # handle_parsing_errors=True,
+    verbose=True
+)
+
 
 
 # Start command
+@check_authorization
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ALLOWED_USERS:
-        await update.message.reply_text("🚫 Sorry, you're not authorized to use this bot.")
-        return
     await update.message.reply_text("Hi! I'm your Finances Bot 💳")
+
+@check_authorization
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    SYSTEM_PROMPT.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
+    response = agent.run(prepend_system_prompt(text))
+
+    await update.message.reply_text(
+        response
+    ) 
 
 async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -34,47 +84,50 @@ async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main runner
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    expense_manager = ExpenseManager(expenses_model)
-    mag_manager = MagManager(mag_model)
+    
 
-    expense_add_handler = ConversationHandler(
-        entry_points=[CommandHandler("add_expenses", expense_manager.start_add)],
-        states={
-            ADD_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_expense_input)]
-        },
-        fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    )
+    # expense_add_handler = ConversationHandler(
+    #     entry_points=[CommandHandler("add_expenses", expense_manager.start_add)],
+    #     states={
+    #         ADD_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_expense_input)]
+    #     },
+    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
+    # )
 
-    expenses_list_handler = ConversationHandler(
-        entry_points=[CommandHandler("list_expenses", expense_manager.start_list)],
-        states={
-            LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_list_input)]
-        },
-        fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    )
+    # expenses_list_handler = ConversationHandler(
+    #     entry_points=[CommandHandler("list_expenses", expense_manager.start_list)],
+    #     states={
+    #         LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_list_input)]
+    #     },
+    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
+    # )
 
-    modify_mag_handler = ConversationHandler(
-        entry_points=[CommandHandler("update_mag", mag_manager.start_modify)],
-        states={
-            UPDATE_MAG: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_mag_change)]
-        },
-        fallbacks=[CommandHandler("cancel", mag_manager.cancel)],
-    )
+    # modify_mag_handler = ConversationHandler(
+    #     entry_points=[CommandHandler("update_mag", mag_manager.start_modify)],
+    #     states={
+    #         UPDATE_MAG: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_mag_change)]
+    #     },
+    #     fallbacks=[CommandHandler("cancel", mag_manager.cancel)],
+    # )
 
-    mag_list_handler = ConversationHandler(
-        entry_points=[CommandHandler("list_mag", mag_manager.start_list)],
-        states={
-            LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_list_input)]
-        },
-        fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    )
+    # mag_list_handler = ConversationHandler(
+    #     entry_points=[CommandHandler("list_mag", mag_manager.start_list)],
+    #     states={
+    #         LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_list_input)]
+    #     },
+    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
+    # )
+
+    
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ipv6", reveal_my_ipv6))
-    app.add_handler(expense_add_handler)
-    app.add_handler(expenses_list_handler)
-    app.add_handler(modify_mag_handler)
-    app.add_handler(mag_list_handler)
+    # app.add_handler(expense_add_handler)
+    # app.add_handler(expenses_list_handler)
+    # app.add_handler(modify_mag_handler)
+    # app.add_handler(mag_list_handler)
 
     print("🤖 Bot is running...")
     app.run_polling()

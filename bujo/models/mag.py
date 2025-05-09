@@ -1,5 +1,8 @@
 import requests
 from typing import Optional, List, Dict, Any
+import json
+
+from bujo import mag
 
 
 class MAG:
@@ -43,14 +46,19 @@ class MAG:
         print("❌ Read failed:", response.status_code, response.text)
         return None
 
-    def update(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update(self, data: str) -> Optional[Dict[str, Any]]:
+        data = json.loads(data.replace('```json', '').replace('```', ''))
+        mag_object = self.find_by_date(data['date_filter'])
+        if not mag_object:
+            return "Failed to find MAG object with the given date filter."
         allowed_keys = {"Id", "Date", "Note", "Tithi", "Exercise"}
-        filtered_data = {key: value for key, value in data.items() if key in allowed_keys}
+        mag_object.update(data['payload'])
+        filtered_data = {key: value for key, value in mag_object.items() if key in allowed_keys}
         response = requests.patch(self._url(), json=filtered_data, headers=self.headers)
         if response.ok:
             return response.text
         print("❌ Update failed:", response.status_code, response.text)
-        return None
+        return 'Updating MAG failed. Try again?'
 
     def delete(self, record_id: str) -> bool:
         response = requests.delete(self._url(f"/{record_id}"), headers=self.headers)
@@ -59,7 +67,8 @@ class MAG:
         print("❌ Delete failed:", response.status_code, response.text)
         return False
 
-    def list(self, limit: int = 25, where: Optional[str] = None, sort: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(self, where: Optional[str] = None, limit: int = 25,  sort: Optional[str] = None) -> List[Dict[str, Any]]:
+        where = json.loads(where.replace('```json', '').replace('```', ''))['filters'] if where else None
         params = {"limit": limit}
         if where:
             params["where"] = where

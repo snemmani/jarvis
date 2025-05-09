@@ -1,151 +1,80 @@
 
-from telegram import Update
-from telegram.ext import ContextTypes, ConversationHandler
-from datetime import datetime
-import json
 from bujo.models.expenses import Expenses
-import litellm
-from bujo.base import ALLOWED_USERS, COHERE_MODEL, cohere_client
+from bujo.models.mag import MAG
+from bujo.base import llm
+from langchain.agents import initialize_agent, Tool
+from langchain.memory import ConversationBufferMemory
+import json
 
 
-# Conversation states
-ADD_EXPENSE_CHAT, LIST_EXPENSE_CHAT = range(2)
+SYSTEM_PROMPT = [
+    "You are an expense tracking assistant. "
+    "Case 1: When a user wants to add an expense, follow below instructions:"
+    "Extract 'Item', 'Amount', and 'Date' (YYYY-MM-DD format) from user inputs like 'Add mangoes for 40 rupees today'. "
+    "Call the tool `add_expense` with a dictionary {Item, Amount, Date}.",
+    "Once the expense is added, respond with 'Expense added on Date for Item ₹Amount'.",
+    "Case 2: When a user want to list expenses, follow below instructions:",
+    """If I ask "Get me expenses from the month of March 2025", you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-03-01)", "(Date,lt,exactDate,2025-04-01)"]}.""",
+    """If I ask "Get me expenses from last month", compute the correct and for example assume month is may 2025 and you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-05-01)", "(Date,lt,exactDate,2025-06-01)"]}.""",
+    """If I ask "Get me expenses for this week", compute the correct week [Week starts with Monday] and for example assume today is 9th May 2025, Friday, then and you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-05-05)", "(Date,lt,exactDate,2025-05-12)"]}.""",
+    """If I ask "Get me expenses for 2025-01-01", you will call the expense lookup tool with {"filters": ["(Date,eq,exactDate,2025-01-01)"]}.""",
+    """The tool input should only be the date filters, do not consider Item or Amount for filters as input to tool, but performing filtering from them after the tool has responded."""
+    "Once the expenses are fetched by the tool, summarize the expenses based on the users request and grouping requirements"
+]
+
+def prepend_system_prompt(user_input: str) -> str:
+    return f"{SYSTEM_PROMPT}\n\nUser: {user_input}"
 
 class ExpenseManager:
-    def __init__(self, expenses_model: Expenses):
+    def __init__(self, expenses_model: Expenses, mag_model: MAG):
         """
         Create an Object of ExpenseManager class.
 
         :param  expenses_model: NocoDB Expenses Model Instance
         """
         self.expenses_model = expenses_model
-        today = datetime.now().strftime("%Y-%m-%d %A")  # e.g. "April 11, 2025"
-        self.messages_add = [
-            {'role': 'system', 'content': f'## LLM ROLE: You are an expert freetext to python serializer. There are following fields in expenses schema: Date, Item, Amount. ##\n## INSTRUCTION: Convert whatever data that I provide into a JSON. There should only be the JSON, nothing else in the response ##\n## INSTRUCTION: If the dates are provided in relative terms i.e yesterday, tomorrow etc.. convert them to  full ISO format ##\n## INSTRUCTION: The dates will and should always be from the past, if a future date is given, substitute today\'s date ##\n## If user provides a freestyle text, try to convert it into above schema.\nToday is {today} ##'}
+        self.mag_model = mag_model
+        self.tools = [
+            Tool(
+                name="Expense Lookup",
+                func=self.expenses_model.list,
+                description="Use this tool to fetch expenses based on specific filters."
+            ),
+            Tool(
+                name="Expense Creation",
+                func=self.add_expense,
+                description="Use this tool to create a new expense entry."
+            )
         ]
 
-        self.messages_list = [
-            {'role': 'system', 'content': f"""LLM ROLE: You are an expert freetext to python serializer and my personal interpretor. There are following fields in expenses schema: Date, Item, Amount.\nINSTRUCTION: You have 1 roles as a part of this exercise\nINSTRUCTION: You will take the input from me and then convert my query to a nocodb filter condition\nINSTRUCTION: Remember that today's date is {today}\nINSTRUCTION Instruction: For example, if I asked Get me expenses from the month of march 2025, you will respond with ["(Date,ge,exactDate,2025-03-1)", "(Date,lt,exactDate,2025-04-01)"]\nINSTRUCTION Instruction: Another example, if I asked Get me expenses from last month, you would check which month last month is, then give me a condition like ["(Date,ge,exactDate,2025-03-01)", "(Date,lt,exactDate,2025-04-01)"]"\nINSTRUCTION Instruction: Another example, if I asked Get me expenses for a specific day ex. 2025-01-01, then you will provide the filter as ["(Date,eq,exactDate,2025-01-01)"]\nINSTRUCTION Instruction: You will respond with the Date Filter query only and nothing else, even if the user asks for summary by groceries or any other item. You will respond with date filters only!. This is the MOST IMPORTANT INSTRUCTION\nINSTRUCTION: If the user asks about a date from future, in any way, keep the end date as today or exact date as today."""}
-        ]
+        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        
+        self.agent = initialize_agent(
+            tools=self.tools, 
+            llm=llm, 
+            agent="chat-conversational-react-description", 
+            memory=self.memory,
+            # handle_parsing_errors=True,
+            verbose=True)
 
-    async def start_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in ALLOWED_USERS:
-            await update.message.reply_text("🚫 You're not authorized to use this bot.")
-            return ConversationHandler.END
-
-        await update.message.reply_text("💰 Add your expenses below. Done adding them? Go for cancel command!")
-        return ADD_EXPENSE_CHAT
+    def agent_expenses(self, prompt: str):
+        text = prompt.strip()
+        response = self.agent.run(prepend_system_prompt(text))
+        return response
     
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🚫 Expenses interaction cancelled.")
-        return ConversationHandler.END
-
-    async def handle_expense_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in ALLOWED_USERS:
-            await update.message.reply_text("🚫 You're not authorized to use this bot.")
-            return ConversationHandler.END
-
-        text = update.message.text.strip()
-
-        messages_copy = self.messages_add.copy()
-        messages_copy.append({'role': 'user', 'content': text})
-
-        gen_ai_response = cohere_client.chat(
-            model=COHERE_MODEL, 
-            messages = messages_copy
-        )
-
-        payload = json.loads(gen_ai_response.message.content[0].text.replace('```json', '').replace('```', ''))
-
-        mag_instance = self.expenses_model.mag_table_instance.find_by_date(payload['Date'])
-        if not mag_instance:
-            await update.message.reply_text("❌ No MAG object found for the given date. Try again?")
-            return ADD_EXPENSE_CHAT
+    def add_expense(self, data: str):
+        """
+        Add an expense to the database.
         
-        expense_instance = self.expenses_model.create(payload)
-        if not expense_instance:
-            await update.message.reply_text("❌ Failed to create expense entry. Try again?")
-            return ADD_EXPENSE_CHAT
-        
-        final_response = self.expenses_model.link_mag_to_expense(expense_instance['Id'], mag_instance['Id'])   
-        if not final_response:
-            await update.message.reply_text("❌ Failed to link expense to MAG. Try again?")
-            return ADD_EXPENSE_CHAT
-        await update.message.reply_text(
-            f"✅ Expense entry added and linked successfully!\n\n"
-            f"📅 Date: {payload['Date']}\n"
-            f"🛒 Item: {payload['Item']}\n"
-            f"💵 Amount: {payload['Amount']}"
-        )
-        return ADD_EXPENSE_CHAT
-
-
-    async def start_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in ALLOWED_USERS:
-            await update.message.reply_text("🚫 You're not authorized to use this bot.")
-            return ConversationHandler.END
-
-        await update.message.reply_text(
-            "📅 Please specify the month (e.g., 'March 2023') or day (e.g., '2023-03-15') for which you want to list expenses."
-        )
-        return LIST_EXPENSE_CHAT
-
-    async def handle_list_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in ALLOWED_USERS:
-            await update.message.reply_text("🚫 You're not authorized to use this bot.")
-            return ConversationHandler.END
-
-        text = update.message.text.strip()
-
-        messages_copy = self.messages_list.copy()
-        messages_copy.append({'role': 'user', 'content': text})
-
-        gen_ai_response = litellm.completion(
-            model="ollama/phi4:latest",
-            messages = messages_copy,
-            api_base="http://localhost:10000"
-        )
-
-        # Parse the input to determine if it's a month or a specific day
-        try:
-            payload = json.loads(gen_ai_response.choices[0].message.content.replace('```json', '').replace('```', ''))
-            expenses = self.expenses_model.list(where=payload)
-
-            if not expenses:
-                await update.message.reply_text(f"❌ No expenses found for the specified period. {payload}")
-                return LIST_EXPENSE_CHAT
-                
-        except Exception:
-            await update.message.reply_text(f"❌ Failed to fetch expenses for payload {payload}.")
-            return LIST_EXPENSE_CHAT
-        
-
-        # Summarize the expenses using Cohere
-        expense_texts = [
-            f"Date: {expense['Date']}, Item: {expense['Item']}, Amount: {expense['Amount']}"
-            for expense in expenses
-        ]
-        summary_prompt = (
-            f"{text}.\nThe expenses data is in the below json payload.\n {payload}.\n ## INSTRUCTION: Currency is always in Indian Rupees with Symbol '₹'\n" +
-            "\n".join(expense_texts)
-        )
-
-        gen_ai_response = litellm.completion(
-            model="ollama/phi4:latest",
-            messages=[{'role': 'user', 'content': summary_prompt}],
-            api_base="http://localhost:10000"
-        )
-
-        summary = gen_ai_response.choices[0].message.content
-
-        await update.message.reply_text(
-            f"📋 Expenses Summary:\n\n{summary}",
-            parse_mode='markdown'
-        )
-        return LIST_EXPENSE_CHAT
-    
+        :param data: JSON string containing the expense data.
+        :return: Response from the expenses model.
+        """
+        data_object = json.loads(data)
+        response_add = self.expenses_model.create(data_object)
+        if 'failed' in str(response_add).lower():
+            return "Failed to add expense entry. Try again?"
+        mag_object = self.mag_model.find_by_date(data_object['Date'])
+        if mag_object:
+            self.expenses_model.link_mag_to_expense(response_add.json().get("Id"), mag_object['Id'])
+        return response_add
     

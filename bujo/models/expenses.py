@@ -2,6 +2,7 @@ import requests
 from typing import Optional, List, Dict, Any
 
 from bujo.models.mag import MAG
+import json
 
 class Expenses:
     def __init__(self, base_url: str, api_token: str, expenses_table_id: str, mag_table_link_id: str, mag_table_instance: MAG):
@@ -31,9 +32,10 @@ class Expenses:
     def create(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         response = requests.post(self._url(), json=data, headers=self.headers)
         if response.ok:
+            # Link the created expense to the MAG entry
             return response.json()
         print("❌ Create failed:", response.status_code, response.text)
-        return None
+        return 'Failed to create expense entry. Try again?'
 
     def read(self, record_id: str) -> Optional[Dict[str, Any]]:
         url = f"{self._url(f'/{record_id}')}"
@@ -57,10 +59,10 @@ class Expenses:
         print("❌ Delete failed:", response.status_code, response.text)
         return False
 
-    def list(self, limit: int = 1000, where: Optional[str] = None, sort: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(self, where: Optional[str] = None, limit: int = 1000,  sort: Optional[str] = None) -> List[Dict[str, Any]]:
         all_results = []
         offset = 0
-
+        where = json.loads(where.replace('```json', '').replace('```', ''))["filters"] if where else None
         while True:
             params = {"limit": limit, "offset": offset}
             if where:
