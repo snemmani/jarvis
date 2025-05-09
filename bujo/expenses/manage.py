@@ -75,6 +75,6 @@ class ExpenseManager:
             return "Failed to add expense entry. Try again?"
         mag_object = self.mag_model.find_by_date(data_object['Date'])
         if mag_object:
-            self.expenses_model.link_mag_to_expense(response_add.json().get("Id"), mag_object['Id'])
+            self.expenses_model.link_mag_to_expense(response_add["Id"], mag_object['Id'])
         return response_add
     
