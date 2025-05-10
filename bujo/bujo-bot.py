@@ -90,7 +90,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SYSTEM_PROMPT.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
     response = await agent.ainvoke(prepend_system_prompt(text))
 
-    if "HERE_IS_IMAGE" in response['output']:
+    if 'output' in response and "HERE_IS_IMAGE" in response['output']:
         try:
             image_url = response['output'].replace("HERE_IS_IMAGE:", '').strip()
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url)
