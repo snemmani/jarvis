@@ -1,4 +1,5 @@
 from ast import mod
+from types import coroutine
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID
@@ -17,7 +18,7 @@ SYSTEM_PROMPT = [
     "If I am talking to you about MAG, you will use the MAG tool to add or list my MAG.",
     "If I am talking to you about latest news, or any knowledge article asking you to exlain something, you use the Search the web tool.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
-    "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool.",
+    "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated respond with HERE_IS_IMAGE: Image link",
 ]
 
 def prepend_system_prompt(user_input: str) -> str:
@@ -30,10 +31,10 @@ memory = ConversationBufferMemory(memory_key="chat_history", return_messages=Tru
 wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
 
-def wolfram_alpha_image_generator(query):
-    response = wolfram_client.query(query)
+async def wolfram_alpha_image_generator(query):
+    response = await wolfram_client.aquery(query)
     if hasattr(response, 'pod') and len(response.pod) > 0 and hasattr(response.pod[0], 'subpod') and len(response.pod[0].subpod) > 0:
-        return response.pod[0].subpod[0].img.src
+        return response.pod[0].subpod.img.src
     else:
         return 'Failed to generate image.'
 
@@ -55,13 +56,14 @@ tools = [
     ),
     Tool(
         name="Wolfram Alpha",
-        func=lambda query: next(wolfram_client.query(query).results).text,
+        func=lambda query: next((wolfram_client.query(query)).results).text,
         description="Use this tool for computing and answering complex queries using Wolfram Alpha."
     ),
     Tool(
         name="Wolfram Alpha Image Generator",
-        func=wolfram_alpha_image_generator,
-        description="Use this tool to generate images for queries using Wolfram Alpha."
+        func=lambda x: 'This tool must be awaited',
+        description="Use this tool to generate images for queries using Wolfram Alpha.",
+        coroutine=wolfram_alpha_image_generator
     )
 ]
 
@@ -86,11 +88,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     SYSTEM_PROMPT.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
-    response = agent.run(prepend_system_prompt(text))
+    response = await agent.ainvoke(prepend_system_prompt(text))
 
-    if "Wolfram Alpha Image Generator" in response:
+    if "HERE_IS_IMAGE" in response['output']:
         try:
-            image_url = response.split("Wolfram Alpha Image Generator: ")[1].strip()
+            image_url = response['output'].replace("HERE_IS_IMAGE:", '').strip()
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url)
         except Exception as e:
             await update.message.reply_text(f"Error generating image: {e}")
