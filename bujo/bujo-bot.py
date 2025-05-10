@@ -8,6 +8,7 @@ from langchain.memory import ConversationBufferMemory
 import requests
 from langchain.agents import initialize_agent, Tool
 from datetime import datetime
+import wolframalpha
 
 SYSTEM_PROMPT = [
     "You are an expert personal assistant that helps me manage my finances and a calender (which I call MAG).",
@@ -16,6 +17,7 @@ SYSTEM_PROMPT = [
     "If I am talking to you about MAG, you will use the MAG tool to add or list my MAG.",
     "If I am talking to you about latest news, or any knowledge article asking you to exlain something, you use the Search the web tool.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
+    "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool.",
 ]
 
 def prepend_system_prompt(user_input: str) -> str:
@@ -24,6 +26,16 @@ def prepend_system_prompt(user_input: str) -> str:
 expense_manager = ExpenseManager(expenses_model, mag_model)
 mag_manager = MagManager(mag_model)
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
+
+
+def wolfram_alpha_image_generator(query):
+    response = wolfram_client.query(query)
+    if hasattr(response, 'pod') and len(response.pod) > 0 and hasattr(response.pod[0], 'subpod') and len(response.pod[0].subpod) > 0:
+        return response.pod[0].subpod[0].img.src
+    else:
+        return 'Failed to generate image.'
 
 tools = [
     Tool(
@@ -43,10 +55,16 @@ tools = [
     ),
     Tool(
         name="Wolfram Alpha",
-        func=lambda query: requests.get(f"https://api.wolframalpha.com/v1/result", params={"i": query, "appid": WOLFRAM_APP_ID}).text,
+        func=lambda query: next(wolfram_client.query(query).results).text,
         description="Use this tool for computing and answering complex queries using Wolfram Alpha."
+    ),
+    Tool(
+        name="Wolfram Alpha Image Generator",
+        func=wolfram_alpha_image_generator,
+        description="Use this tool to generate images for queries using Wolfram Alpha."
     )
 ]
+
 
 agent = initialize_agent(
     tools=tools, 
@@ -70,9 +88,16 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SYSTEM_PROMPT.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
     response = agent.run(prepend_system_prompt(text))
 
-    await update.message.reply_text(
-        response
-    ) 
+    if "Wolfram Alpha Image Generator" in response:
+        try:
+            image_url = response.split("Wolfram Alpha Image Generator: ")[1].strip()
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url)
+        except Exception as e:
+            await update.message.reply_text(f"Error generating image: {e}")
+    else:
+        await update.message.reply_text(
+            response
+        ) 
 
 async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id

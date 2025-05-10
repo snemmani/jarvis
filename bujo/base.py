@@ -9,7 +9,7 @@ from telegram.ext import ConversationHandler
 from telegram import Update
 from telegram.ext import ContextTypes
 
-# load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 # Globals
 ALLOWED_USERS = [int(os.environ["TELEGRAM_USER_ID"])]
 COHERE_MODEL = os.environ["COHERE_MODEL"]
