@@ -1,2 +1,2 @@
-# expenses-bot
-My Expenses Bot
+# JARVIS Bot
+My Personal Manager on Telegram.
