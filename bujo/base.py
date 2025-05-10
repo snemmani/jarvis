@@ -23,7 +23,7 @@ NOCODB_MAG_TABLE_ID = os.environ["NOCODB_MAG_TABLE_ID"]
 NOCODB_EXPENSES_MAG_LINK_ID = os.environ["NOCODB_EXPENSES_MAG_LINK_ID"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 SERP_API_KEY = os.environ["SERP_API_KEY"]
-
+WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 # Initializations
 llm = ChatCohere(model=COHERE_MODEL, temperature=0)
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)

@@ -14,6 +14,7 @@ SYSTEM_PROMPT = [
     "Call the tool `add_expense` with a dictionary {Item, Amount, Date}.",
     "Once the expense is added, respond with 'Expense added on Date for Item ₹Amount'.",
     "Case 2: When a user want to list expenses, follow below instructions:",
+    """For this case your input to the tool should be JSON strings and not JSON objects directly, the tool will take care of converting it to JSON object."""
     """If I ask "Get me expenses from the month of March 2025", you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-03-01)", "(Date,lt,exactDate,2025-04-01)"]}.""",
     """If I ask "Get me expenses from last month", compute the correct and for example assume month is may 2025 and you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-05-01)", "(Date,lt,exactDate,2025-06-01)"]}.""",
     """If I ask "Get me expenses for this week", compute the correct week [Week starts with Monday] and for example assume today is 9th May 2025, Friday, then and you will call the expense lookup tool with {"filters": ["(Date,ge,exactDate,2025-05-05)", "(Date,lt,exactDate,2025-05-12)"]}.""",

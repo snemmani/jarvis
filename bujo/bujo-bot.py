@@ -1,7 +1,7 @@
 from ast import mod
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY
+from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from langchain.memory import ConversationBufferMemory
@@ -12,6 +12,10 @@ from datetime import datetime
 SYSTEM_PROMPT = [
     "You are an expert personal assistant that helps me manage my finances and a calender (which I call MAG).",
     "Depending upon my request you will interact with the specific tool, either Expenses tool or MAG tool or Search the Web."
+    "If I am talking to you about expenses, you will use the Expenses tool to add or list my expenses.",
+    "If I am talking to you about MAG, you will use the MAG tool to add or list my MAG.",
+    "If I am talking to you about latest news, or any knowledge article asking you to exlain something, you use the Search the web tool.",
+    "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
 ]
 
 def prepend_system_prompt(user_input: str) -> str:
@@ -36,6 +40,11 @@ tools = [
         name="Search the Web",
         func=lambda query: requests.get(f"https://serpapi.com/search", params={"q": query, "api_key": SERP_API_KEY}).json(),
         description="Use this tool to search the web for information based on the user's query."
+    ),
+    Tool(
+        name="Wolfram Alpha",
+        func=lambda query: requests.get(f"https://api.wolframalpha.com/v1/result", params={"i": query, "appid": WOLFRAM_APP_ID}).text,
+        description="Use this tool for computing and answering complex queries using Wolfram Alpha."
     )
 ]
 
