@@ -98,7 +98,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Error generating image: {e}")
     else:
         await update.message.reply_text(
-            response
+            response['output']
         ) 
 
 async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
