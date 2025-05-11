@@ -67,7 +67,7 @@ class MagManager:
 
     def agent_mag(self, prompt: str):
         text = prompt.strip()
-        response = self.agent.invoke(prepend_system_prompt(text))
+        response = self.agent.run(prepend_system_prompt(text))
         return response
 
     
