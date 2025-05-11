@@ -33,8 +33,8 @@ wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
 async def wolfram_alpha_image_generator(query):
     response = await wolfram_client.aquery(query)
-    if hasattr(response, 'pod') and len(response.pod) > 0 and hasattr(response.pod[0], 'subpod') and len(response.pod[0].subpod) > 0:
-        return response.pod[0].subpod.img.src
+    if hasattr(response, 'pod') and len(response.pod) > 1:
+        return response.pod[1].subpod.img.src
     else:
         return 'Failed to generate image.'
 
