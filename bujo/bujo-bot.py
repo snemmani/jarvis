@@ -16,9 +16,10 @@ SYSTEM_PROMPT = [
     "Depending upon my request you will interact with the specific tool, either Expenses tool or MAG tool or Search the Web."
     "If I am talking to you about expenses, you will use the Expenses tool to add or list my expenses.",
     "If I am talking to you about MAG, you will use the MAG tool to add or list my MAG.",
-    "If I am talking to you about latest news, or any knowledge article asking you to exlain something, you use the Search the web tool.",
+    "If I am talking to you about latest news, or any knowledge article asking you to explain something, you use the Search the web tool.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated respond with HERE_IS_IMAGE: Image link",
+    "If I am talking to you about translations from one language to another, use the Translation tool, and remember if I ever ask you to translate to Sanskrit, always provide sanskrit translations in telugu text"
 ]
 
 def prepend_system_prompt(user_input: str) -> str:
@@ -64,6 +65,11 @@ tools = [
         func=lambda x: 'This tool must be awaited',
         description="Use this tool to generate images for queries using Wolfram Alpha.",
         coroutine=wolfram_alpha_image_generator
+    ),
+    Tool(
+        name="Translation Tool",
+        func=lambda x: llm.generate(x),
+        description="Use this tool to translate from one language to another."
     )
 ]
 
