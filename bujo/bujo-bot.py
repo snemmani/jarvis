@@ -68,7 +68,7 @@ tools = [
     ),
     Tool(
         name="Translation Tool",
-        func=lambda x: llm.generate({'role':'user','content':x}),
+        func=lambda x: llm.generate([{'role':'user','content':x}]),
         description="Use this tool to translate from one language to another."
     )
 ]
