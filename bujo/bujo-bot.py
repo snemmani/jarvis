@@ -1,4 +1,4 @@
-from ast import mod
+from ast import mod, parse
 from types import coroutine
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -104,7 +104,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Error generating image: {e}")
     else:
         await update.message.reply_text(
-            response['output']
+            response['output'],
+            parse_mode='MarkdownV2',
         ) 
 
 async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
