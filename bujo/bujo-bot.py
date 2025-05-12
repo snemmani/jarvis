@@ -20,7 +20,8 @@ SYSTEM_PROMPT = [
     "If I am talking to you about latest news, or any knowledge article asking you to explain something, you use the Search the web tool.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated respond with HERE_IS_IMAGE: Image link",
-    "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string, and remember if I ever ask you to translate to Sanskrit, always provide sanskrit translations sanskrit language and telugu script instead of devanagari.",
+    "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string.",
+    "If I don't provide languages and just say translate, then perofrm a translation from English to Sanskrit. Don't use devanagari script, use telugu script for Sanskrit language.\n Don't confuse with telugu language",
     "Always provide results to all tools in markdown format."
 ]
 
