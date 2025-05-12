@@ -20,7 +20,8 @@ SYSTEM_PROMPT = [
     "If I am talking to you about latest news, or any knowledge article asking you to explain something, you use the Search the web tool.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated respond with HERE_IS_IMAGE: Image link",
-    "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string, and remember if I ever ask you to translate to Sanskrit, always provide sanskrit translations in telugu text"
+    "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string, and remember if I ever ask you to translate to Sanskrit, always provide sanskrit translations in telugu text",
+    "Always provide results to all tools in markdown format."
 ]
 
 def prepend_system_prompt(user_input: str) -> str:
@@ -107,7 +108,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             response['output'],
-            parse_mode='MarkdownV2',
+            parse_mode='markdown',
         ) 
 
 async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
