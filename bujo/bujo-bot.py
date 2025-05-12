@@ -21,7 +21,8 @@ SYSTEM_PROMPT = [
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated respond with HERE_IS_IMAGE: Image link",
     "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string.",
-    "If I don't provide languages and just say translate, then perofrm a translation from English to Sanskrit. Don't use devanagari script, use telugu script for Sanskrit language.\n Don't confuse with telugu language",
+    "If I don't provide languages and just give a command translate, then perform a translation from English to Sanskrit. If I provide languages, then translate from the source language to the target language.",
+    "After translation, if the result script is in devanaagari, then convert it to a telugu script without perofmring a translation",
     "Always provide results to all tools in markdown format."
 ]
 
