@@ -1,10 +1,10 @@
-
 from datetime import datetime
 from bujo.base import llm
 from bujo.models.mag import MAG
 from langchain.agents import initialize_agent, Tool
 from datetime import datetime
 from langchain.memory import ConversationBufferMemory
+import logging
 
 SYSTEM_PROMPT = [
     "You are an MAG (Calendar) managing assistant. "
@@ -42,6 +42,10 @@ class MagManager:
         """
         self.mag_model = mag_model
 
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+
         self.tools = [
             Tool(
                 name="Update MAG",
@@ -54,6 +58,7 @@ class MagManager:
                 description="Use this tool to create a new expense entry."
             )
         ]
+        self.logger.info("Initialized tools for MAG management.")
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         
         self.agent = initialize_agent(
@@ -64,11 +69,13 @@ class MagManager:
             # handle_parsing_errors=True,
             verbose=True)
 
-
     def agent_mag(self, prompt: str):
         text = prompt.strip()
-        response = self.agent.run(prepend_system_prompt(text))
-        return response
-
-    
-    
+        self.logger.info(f"Received prompt: {text}")
+        try:
+            response = self.agent.run(prepend_system_prompt(text))
+            self.logger.info(f"Agent response: {response}")
+            return response
+        except Exception as e:
+            self.logger.error(f"Error in agent_mag: {e}", exc_info=True)
+            return "An error occurred while processing your request."

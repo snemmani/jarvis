@@ -35,7 +35,7 @@ class Expenses:
             # Link the created expense to the MAG entry
             return response.json()
         print("❌ Create failed:", response.status_code, response.text)
-        return 'Failed to create expense entry. Try again?'
+        return 'failed to create expense entry. Try again?'
 
     def read(self, record_id: str) -> Optional[Dict[str, Any]]:
         url = f"{self._url(f'/{record_id}')}"
