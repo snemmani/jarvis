@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
 # Set additional environment variables
-ENV PYTHONPATH="/app"
+ENV PYTHONPATH="/app:$PYTHONPATH"
 
 # Command to run the bot
 CMD ["python", "bujo/bujo-bot.py"]

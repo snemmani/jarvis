@@ -8,8 +8,15 @@ from langchain_cohere import ChatCohere
 from telegram.ext import ConversationHandler
 from telegram import Update
 from telegram.ext import ContextTypes
+import logging
 
-# load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
+#logging.basicConfig(
+#    level=logging.INFO,
+#    format="%(asctime)s [%(levelname)s] %(message)s",
+#    handlers=[logging.StreamHandler()]  # sends to stdout/stderr
+#)
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 # Globals
 ALLOWED_USERS = [int(os.environ["TELEGRAM_USER_ID"])]
 COHERE_MODEL = os.environ["COHERE_MODEL"]
@@ -24,6 +31,8 @@ NOCODB_EXPENSES_MAG_LINK_ID = os.environ["NOCODB_EXPENSES_MAG_LINK_ID"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 SERP_API_KEY = os.environ["SERP_API_KEY"]
 WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
+PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
+BROADCAST_IP = os.environ["BROADCAST_IP"]
 # Initializations
 llm = ChatCohere(model=COHERE_MODEL, temperature=0)
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)

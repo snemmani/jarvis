@@ -2,7 +2,7 @@ from ast import mod, parse
 from types import coroutine
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID
+from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from langchain.memory import ConversationBufferMemory
@@ -11,6 +11,12 @@ import requests
 from langchain.agents import initialize_agent, Tool
 from datetime import datetime
 import wolframalpha
+from wakeonlan import send_magic_packet
+import langchain
+import logging
+
+logger = logging.getLogger("langchain")
+logger.setLevel(logging.DEBUG)
 
 SYSTEM_PROMPT = [
     "You are an expert personal assistant that helps me manage my finances and a calender (which I call MAG).",
@@ -112,21 +118,13 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='markdown',
         ) 
 
-async def reveal_my_ipv6(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ALLOWED_USERS:
-        await update.message.reply_text("🚫 Sorry, you're not authorized to use this bot.")
-        return
+@check_authorization
+async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        response = requests.get("https://api64.ipify.org?format=json")
-        if response.status_code != 200:
-            await update.message.reply_text("Error fetching IPv6 address.")
-            return
-        ipv6_address = response.json().get("ip", "Unable to fetch IPv6 address")
-        await update.message.reply_text(f"Your public IPv6 address is: {ipv6_address}")
-        return
+        send_magic_packet(PC_MAC_ADDRESS, ip_address=BROADCAST_IP)
+        await update.message.reply_text("🔌 Magic packet sent to wake up the PC.")
     except requests.RequestException as e:
-        await update.message.reply_text(f"Error fetching IPv6 address: {e}")
+        await update.message.reply_text(f"Waking up the PC: {e}")
 
 # Main runner
 if __name__ == '__main__':
@@ -170,7 +168,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ipv6", reveal_my_ipv6))
+    app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     # app.add_handler(expense_add_handler)
     # app.add_handler(expenses_list_handler)
     # app.add_handler(modify_mag_handler)
