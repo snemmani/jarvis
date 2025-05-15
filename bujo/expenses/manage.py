@@ -1,4 +1,5 @@
 import logging
+from math import log
 from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 from bujo.base import llm
@@ -96,6 +97,9 @@ class ExpenseManager:
             if mag_object:
                 logger.info(f"Linking MAG {mag_object['Id']} to expense {response_add['Id']}")
                 self.expenses_model.link_mag_to_expense(response_add["Id"], mag_object['Id'])
+            else:
+                logger.info("No MAG entry found to link with the expense.")
+                return "Expense added but no MAG entry found to link the expense to that date!"
             return response_add
         except Exception as e:
             logger.error(f"Error in add_expense: {e}", exc_info=True)
