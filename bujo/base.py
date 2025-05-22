@@ -8,6 +8,7 @@ from langchain_cohere import ChatCohere
 from telegram.ext import ConversationHandler
 from telegram import Update
 from telegram.ext import ContextTypes
+from langchain_xai import ChatXAI
 import logging
 
 #logging.basicConfig(
@@ -19,11 +20,13 @@ import logging
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 # Globals
 ALLOWED_USERS = [int(os.environ["TELEGRAM_USER_ID"])]
-COHERE_MODEL = os.environ["COHERE_MODEL"]
+# COHERE_MODEL = os.environ["COHERE_MODEL"]
+GROK_MODEL = os.environ["GROK_MODEL"]
 NOCODB_BASE_URL = os.environ["NOCODB_BASE_URL"]
 
 # Secrets
-COHERE_API_KEY = os.environ['COHERE_API_KEY']
+# COHERE_API_KEY = os.environ['COHERE_API_KEY']
+XAI_API_KEY = os.environ['XAI_API_KEY']
 NOCODB_API_TOKEN = os.environ['NOCODB_API_TOKEN']
 NOCODB_EXPENSES_TABLE_ID = os.environ["NOCODB_EXPENSES_TABLE_ID"]
 NOCODB_MAG_TABLE_ID = os.environ["NOCODB_MAG_TABLE_ID"]
@@ -34,7 +37,7 @@ WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
 BROADCAST_IP = os.environ["BROADCAST_IP"]
 # Initializations
-llm = ChatCohere(model=COHERE_MODEL, temperature=0)
+llm = ChatXAI(model=GROK_MODEL, temperature=0)
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
 expenses_model = Expenses(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_EXPENSES_TABLE_ID, NOCODB_EXPENSES_MAG_LINK_ID, mag_model)
 expense_add_messages=[

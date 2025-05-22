@@ -102,7 +102,7 @@ agent = initialize_agent(
     tools=tools, 
     llm=llm, 
     agent="chat-conversational-react-description", 
-    memory=memory,
+    # memory=memory,
     # handle_parsing_errors=True,
     verbose=True
 )

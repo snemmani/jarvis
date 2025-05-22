@@ -7,3 +7,4 @@ dotenv
 langchain-cohere
 wolframalpha
 wakeonlan
+langchain-xai
