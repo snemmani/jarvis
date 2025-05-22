@@ -28,6 +28,7 @@ SYSTEM_PROMPT = [
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated, do not modify the response from the tool, just send it as is.",
     "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string.",
     "If I don't provide languages and just give a command translate, then perform a translation from English to Sanskrit. If I provide languages, then translate from the source language to the target language.",
+    "MOST IMPORTANT INSTRUCTION: You will always respond by calling the tool in context for the latest message from user and will not respond without calling appropriate tool",
     "Always provide results to all tools in markdown format."
 ]
 
@@ -40,8 +41,8 @@ logging.basicConfig(
     ]
 )
 
-def prepend_system_prompt(user_input: str) -> str:
-    return f"{SYSTEM_PROMPT}\n\nUser: {user_input}"
+def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
+    return f"{sys_prompt}\n\nUser: {user_input}"
 
 expense_manager = ExpenseManager(expenses_model, mag_model)
 mag_manager = MagManager(mag_model)
@@ -117,9 +118,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     logger.info(f"Received chat message from user {update.effective_user.id}: {text}")
-    SYSTEM_PROMPT.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
+    sys_prompt = SYSTEM_PROMPT.copy()
+    sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
     try:
-        response = await agent.ainvoke(prepend_system_prompt(text))
+        response = await agent.ainvoke(prepend_system_prompt(text, sys_prompt))
         logger.info(f"Agent response: {response}")
         if 'output' in response and "HERE_IS_IMAGE" in response['output']:
             try:

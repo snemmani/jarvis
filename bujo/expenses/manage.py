@@ -5,6 +5,7 @@ from bujo.models.mag import MAG
 from bujo.base import llm
 from langchain.agents import initialize_agent, Tool
 from langchain.memory import ConversationBufferMemory
+from datetime import datetime
 import json
 
 # Configure logging
@@ -30,8 +31,8 @@ SYSTEM_PROMPT = [
     "Once the expenses are fetched by the tool, summarize the expenses based on the users request and grouping requirements"
 ]
 
-def prepend_system_prompt(user_input: str) -> str:
-    return f"{SYSTEM_PROMPT}\n\nUser: {user_input}"
+def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
+    return f"{sys_prompt}\n\nUser: {user_input}"
 
 class ExpenseManager:
     def __init__(self, expenses_model: Expenses, mag_model: MAG):
@@ -70,8 +71,10 @@ class ExpenseManager:
     def agent_expenses(self, prompt: str):
         text = prompt.strip()
         logger.info(f"Received prompt: {text}")
+        sys_prompt = SYSTEM_PROMPT.copy()
+        sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
         try:
-            response = self.agent.run(prepend_system_prompt(text))
+            response = self.agent.invoke(prepend_system_prompt(text, sys_prompt))
             logger.info(f"Agent response: {response}")
             return response
         except Exception as e:

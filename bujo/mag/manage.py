@@ -29,9 +29,9 @@ SYSTEM_PROMPT = [
     'Once the MAG is fetched by the tool, summarize the MAG based on the users request and grouping requirements'
 ]
 
-def prepend_system_prompt(user_input: str) -> str:
+def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
     date_today = datetime.now().strftime("%Y-%m-%d %A")  # e.g. "April 11, 2025"
-    return f"{SYSTEM_PROMPT}\nToday's date is {date_today}\n\nUser: {user_input}"
+    return f"{sys_prompt}\nToday's date is {date_today}\n\nUser: {user_input}"
 
 class MagManager:
     def __init__(self, mag_model: MAG):
@@ -72,8 +72,10 @@ class MagManager:
     def agent_mag(self, prompt: str):
         text = prompt.strip()
         self.logger.info(f"Received prompt: {text}")
+        sys_prompt = SYSTEM_PROMPT.copy()
+        sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
         try:
-            response = self.agent.run(prepend_system_prompt(text))
+            response = self.agent.invoke(prepend_system_prompt(text, sys_prompt))
             self.logger.info(f"Agent response: {response}")
             return response
         except Exception as e:
