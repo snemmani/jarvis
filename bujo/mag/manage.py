@@ -2,6 +2,7 @@ from datetime import datetime
 from bujo.base import llm
 from bujo.models.mag import MAG
 from langchain.agents import initialize_agent, Tool
+from langchain.agents.agent_types import AgentType
 from datetime import datetime
 from langchain.memory import ConversationBufferMemory
 import logging
@@ -64,8 +65,8 @@ class MagManager:
         self.agent = initialize_agent(
             tools=self.tools, 
             llm=llm, 
-            agent="chat-conversational-react-description", 
-            memory=self.memory,
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            # memory=self.memory,
             # handle_parsing_errors=True,
             verbose=True)
 

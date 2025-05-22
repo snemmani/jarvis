@@ -5,6 +5,7 @@ from bujo.models.mag import MAG
 from bujo.base import llm
 from langchain.agents import initialize_agent, Tool
 from langchain.memory import ConversationBufferMemory
+from langchain.agents.agent_types import AgentType
 from datetime import datetime
 import json
 
@@ -19,7 +20,7 @@ SYSTEM_PROMPT = [
     "You are an expense tracking assistant. "
     "Case 1: When a user wants to add an expense, follow below instructions:"
     "Extract 'Item', 'Amount', and 'Date' (YYYY-MM-DD format) from user inputs like 'Add mangoes for 40 rupees today'. "
-    "Call the tool `add_expense` with a dictionary {Item, Amount, Date}.",
+    "Call the tool `add_expense` with a Json String {Item: \"Some Item\", Amount: 30, Date: \"2025-05-01\"}.",
     "Once the expense is added, respond with 'Expense added on Date for Item ₹Amount'.",
     "Case 2: When a user want to list expenses, follow below instructions:",
     """For this case your input to the tool should be JSON strings and not JSON objects directly, the tool will take care of converting it to JSON object.""",
@@ -62,8 +63,8 @@ class ExpenseManager:
         self.agent = initialize_agent(
             tools=self.tools, 
             llm=llm, 
-            agent="chat-conversational-react-description", 
-            memory=self.memory,
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, 
+            # memory=self.memory,
             # handle_parsing_errors=True,
             verbose=True)
         logger.info("ExpenseManager initialized successfully")

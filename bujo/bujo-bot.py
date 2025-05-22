@@ -9,12 +9,13 @@ from langchain.memory import ConversationBufferMemory
 from langchain_core.messages import HumanMessage
 import requests
 from langchain.agents import initialize_agent, Tool
+from langchain.agents.agent_types import AgentType
 from datetime import datetime
 import wolframalpha
 from wakeonlan import send_magic_packet
-import langchain
 import logging
 import sys
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ SYSTEM_PROMPT = [
     "Depending upon my request you will interact with the specific tool, either Expenses tool or MAG tool or Search the Web."
     "If I am talking to you about expenses, you will use the Expenses tool to add or list my expenses.",
     "If I am talking to you about MAG, you will use the MAG tool to add or list my MAG.",
-    "If I am talking to you about latest news, or any knowledge article asking you to explain something, you use the Search the web tool.",
+    "If I am talking to you about latest news, or any knowledge article asking you to explain something, you use the Search the web tool. The tool outputs results as JSON, convert it to natural language before responding to user.",
     "If I am talking to you about complex mathematics, prices of stocks or trends of stocks, or for complex tasks that google might not be handled, try wolfram alpha tool."
     "If I am talking to you about generating images or visualizations, use wolfram alpha image generator tool. Once the image link is generated, do not modify the response from the tool, just send it as is.",
     "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string.",
@@ -76,7 +77,7 @@ tools = [
     ),
     Tool(
         name="Search the Web",
-        func=lambda query: requests.get(f"https://serpapi.com/search", params={"q": query, "api_key": SERP_API_KEY}).json(),
+        func=lambda query: json.dumps(requests.get(f"https://serpapi.com/search", params={"q": query, "api_key": SERP_API_KEY}).json(), indent=2),
         description="Use this tool to search the web for information based on the user's query."
     ),
     Tool(
@@ -102,9 +103,9 @@ tools = [
 agent = initialize_agent(
     tools=tools, 
     llm=llm, 
-    agent="chat-conversational-react-description", 
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, 
     # memory=memory,
-    # handle_parsing_errors=True,
+    handle_parsing_errors=True,
     verbose=True
 )
 
