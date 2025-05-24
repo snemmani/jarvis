@@ -5,17 +5,20 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Conve
 from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
-from langchain.memory import ConversationBufferMemory
-from langchain_core.messages import HumanMessage
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_core.messages import trim_messages
+from langchain_core.messages import HumanMessage, SystemMessage
 import requests
 from langchain.agents import initialize_agent, Tool
 from langchain.agents.agent_types import AgentType
 from datetime import datetime
 import wolframalpha
 from wakeonlan import send_magic_packet
+from langchain.prompts.chat import ChatPromptTemplate
 import logging
 import sys
 import json
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +48,16 @@ logging.basicConfig(
 def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
     return f"{sys_prompt}\n\nUser: {user_input}"
 
+def build_chat_messages(user_input: str, sys_prompt: str) -> List[Dict[str, str]]:
+    return [
+        {'role': 'system', 'content':sys_prompt},
+        {'role':'human', 'content': user_input}
+    ]
+
 expense_manager = ExpenseManager(expenses_model, mag_model)
 mag_manager = MagManager(mag_model)
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+trimmer = trim_messages(strategy="last", max_tokens=50, token_counter=len, start_on="human", end_on=("human", "tool"), include_system=True, allow_partial=False)
+memory = ConversationBufferWindowMemory(k=3, memory_key="chat_history", return_messages=True)
 
 wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
@@ -103,9 +113,9 @@ tools = [
 agent = initialize_agent(
     tools=tools, 
     llm=llm, 
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, 
-    # memory=memory,
-    handle_parsing_errors=True,
+    agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
+    memory=memory,
+    # handle_parsing_errors=True,
     verbose=True
 )
 

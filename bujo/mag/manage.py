@@ -4,8 +4,9 @@ from bujo.models.mag import MAG
 from langchain.agents import initialize_agent, Tool
 from langchain.agents.agent_types import AgentType
 from datetime import datetime
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferWindowMemory
 import logging
+from typing import List, Dict
 
 SYSTEM_PROMPT = [
     "You are an MAG (Calendar) managing assistant. "
@@ -30,9 +31,11 @@ SYSTEM_PROMPT = [
     'Once the MAG is fetched by the tool, summarize the MAG based on the users request and grouping requirements'
 ]
 
-def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
-    date_today = datetime.now().strftime("%Y-%m-%d %A")  # e.g. "April 11, 2025"
-    return f"{sys_prompt}\nToday's date is {date_today}\n\nUser: {user_input}"
+def build_chat_messages(user_input: str, sys_prompt: str) -> List[Dict[str, str]]:
+    return [
+        {'role': 'system', 'content':sys_prompt},
+        {'role':'human', 'content': user_input}
+    ]
 
 class MagManager:
     def __init__(self, mag_model: MAG):
@@ -60,13 +63,13 @@ class MagManager:
             )
         ]
         self.logger.info("Initialized tools for MAG management.")
-        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        self.memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=2)
         
         self.agent = initialize_agent(
             tools=self.tools, 
             llm=llm, 
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            # memory=self.memory,
+            agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
+            memory=self.memory,
             # handle_parsing_errors=True,
             verbose=True)
 
@@ -76,7 +79,7 @@ class MagManager:
         sys_prompt = SYSTEM_PROMPT.copy()
         sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
         try:
-            response = self.agent.invoke(prepend_system_prompt(text, sys_prompt))
+            response = self.agent.invoke(build_chat_messages(text, sys_prompt))
             self.logger.info(f"Agent response: {response}")
             return response
         except Exception as e:
