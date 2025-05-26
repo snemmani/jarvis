@@ -59,7 +59,7 @@ class MagManager:
             Tool(
                 name="List MAG",
                 func=self.mag_model.list,
-                description="Use this tool to create a new expense entry."
+                description="Use this tool to list entries."
             )
         ]
         self.logger.info("Initialized tools for MAG management.")
