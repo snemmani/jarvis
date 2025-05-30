@@ -79,9 +79,9 @@ class MagManager:
         sys_prompt = SYSTEM_PROMPT.copy()
         sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
         try:
-            response = self.agent.invoke(build_chat_messages(text, sys_prompt))
+            response = self.agent.invoke(str(build_chat_messages(text, '\n'.join(sys_prompt))))
             self.logger.info(f"Agent response: {response}")
-            return response
+            return response['output']
         except Exception as e:
             self.logger.error(f"Error in agent_mag: {e}", exc_info=True)
             return "An error occurred while processing your request."

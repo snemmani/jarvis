@@ -11,6 +11,7 @@ from telegram.ext import ConversationHandler
 from telegram import Update
 from telegram.ext import ContextTypes
 import logging
+import json
 
 #logging.basicConfig(
 #    level=logging.INFO,
@@ -37,6 +38,25 @@ WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
 BROADCAST_IP = os.environ["BROADCAST_IP"]
 # Initializations
+_original_create_chat_result = ChatOpenAI._create_chat_result
+
+
+def patched_create_chat_result(self, response, generation_info):
+    # Iterate over each choice in the ChatCompletion response.
+    for choice in response.choices:
+        message = choice.message
+        # Check if the message has a tool_calls attribute.
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for tool_call in message.tool_calls:
+                # Check if the tool_call has a function with arguments.
+                if hasattr(tool_call, "function") and hasattr(tool_call.function, "arguments"):
+                    if not isinstance(tool_call.function.arguments, str):
+                        tool_call.function.arguments = json.dumps(tool_call.function.arguments)
+    return _original_create_chat_result(self, response, generation_info)
+
+
+ChatOpenAI._create_chat_result = patched_create_chat_result
+
 llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
 expenses_model = Expenses(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_EXPENSES_TABLE_ID, NOCODB_EXPENSES_MAG_LINK_ID, mag_model)

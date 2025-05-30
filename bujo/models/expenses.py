@@ -1,5 +1,6 @@
 import requests
 from typing import Optional, List, Dict, Any
+import json
 
 from bujo.models.mag import MAG
 import json

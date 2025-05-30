@@ -4,7 +4,7 @@ cohere
 langchain
 langchain_community
 dotenv
-langchain-cohere
+langchain-openai
 wolframalpha
 wakeonlan
 langchain-xai

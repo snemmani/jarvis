@@ -33,6 +33,7 @@ SYSTEM_PROMPT = [
     "If I am talking to you about translations from one language to another, call the Translation tool with the user input as string.",
     "If I don't provide languages and just give a command translate, then perform a translation from English to Sanskrit. If I provide languages, then translate from the source language to the target language.",
     "MOST IMPORTANT INSTRUCTION: You will always respond by calling the tool in context for the latest message from user and will not respond without calling appropriate tool",
+    "Final and most important instruction, when sending the response to either LLM for summarization or back to user, you will send it as string only and not a JSON object"
     "Always provide results to all tools in markdown format."
 ]
 
@@ -78,12 +79,15 @@ tools = [
     Tool(
         name="Expenses Interaction",
         func=expense_manager.agent_expenses,
-        description="Use this tool to fetch expenses based on specific filters."
+        description="Use this tool to fetch expenses based on specific filters.",
+        return_direct=True,
+
     ),
     Tool(
         name="MAG interaction",
         func=mag_manager.agent_mag,
-        description="Use this tool to manage MAG."
+        description="Use this tool to manage MAG.",
+        return_direct=True
     ),
     Tool(
         name="Search the Web",
@@ -116,7 +120,8 @@ agent = initialize_agent(
     agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
     memory=memory,
     # handle_parsing_errors=True,
-    verbose=True
+    verbose=True,
+    debug=True
 )
 
 # Start command
