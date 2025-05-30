@@ -6,7 +6,6 @@ from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 from dotenv import load_dotenv
 from functools import wraps
-from langchain_cohere import ChatCohere
 from telegram.ext import ConversationHandler
 from telegram import Update
 from telegram.ext import ContextTypes

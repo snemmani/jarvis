@@ -1,7 +1,6 @@
 import logging
 from math import log
 
-from proto import Message
 from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 from bujo.base import llm
