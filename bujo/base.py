@@ -56,7 +56,7 @@ def patched_create_chat_result(self, response, generation_info):
 
 ChatOpenAI._create_chat_result = patched_create_chat_result
 
-llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+llm = ChatOpenAI(model=OPENAI_MODEL)
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
 expenses_model = Expenses(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_EXPENSES_TABLE_ID, NOCODB_EXPENSES_MAG_LINK_ID, mag_model)
 expense_add_messages=[
