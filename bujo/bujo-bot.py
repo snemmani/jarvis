@@ -96,9 +96,6 @@ async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_
         if hasattr(response, 'pod'):
             for pod in response.pod:
                 await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
-        if hasattr(response, 'results'):
-            for result in response.results:
-                pass
         return "Response completed."
     
     return Tool(
