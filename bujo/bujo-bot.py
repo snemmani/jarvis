@@ -78,6 +78,15 @@ async def wolfram_alpha_image_generator(query):
     else:
         logger.warning("Failed to generate image.")
         return 'Failed to generate image.'
+    
+async def wolfram_alpha_data_generator(query):
+    logger.info(f"Queriying Wolfram Alpha for query: {query}")
+    response = await wolfram_client.aquery(query)
+    if hasattr(response, 'results') and len(response.results) > 0:
+        return next(response.results).text
+    else:
+        logger.warning("Failed to generate finding.")
+        return 'Failed to generate finding.'
 
 tools = [
     Tool(
@@ -100,8 +109,9 @@ tools = [
     ),
     Tool(
         name="Wolfram Alpha",
-        func=lambda query: next((wolfram_client.query(query)).results).text,
-        description="Use this tool for computing and answering complex queries using Wolfram Alpha."
+        func=lambda x: x,
+        description="Use this tool for computing and answering complex queries using Wolfram Alpha.",
+        coroutine=wolfram_alpha_data_generator,
     ),
     Tool(
         name="Wolfram Alpha Image Generator",
