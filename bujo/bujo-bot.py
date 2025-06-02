@@ -1,5 +1,6 @@
 from ast import mod, parse
 from types import coroutine
+from attr import has
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP
@@ -19,6 +20,7 @@ import logging
 import sys
 import json
 from typing import List, Dict
+import telegram
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +31,8 @@ SYSTEM_PROMPT = [
 
     "1. Expenses Tool – If I talk about expenses, use this tool to add or list my expenses.",
     "2. MAG Tool – If I talk about MAG (my calendar/events), use this tool to add or list my MAG.",
-    "3. Web Search Tool – If I ask about news, explanations of concepts, or current information, use this tool. The tool returns a JSON object. You must convert the content into natural language before replying to me.",
-    "4. Wolfram Alpha Tool – If I ask about complex mathematics, stock prices, or trends, use this tool for accurate answers.",
-    "5. Wolfram Alpha Image Generator – If I ask for visualizations or generated images, use this tool. Do not modify the image URL or output — return it directly as-is.",
-    "6. Translation Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
+    "3. Wolfram Alpha Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
+    "4. Translation Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
 
     "MOST IMPORTANT INSTRUCTIONS:",
     "Always call the appropriate tool based on my latest message. You must never answer directly without invoking a tool first.",
@@ -66,28 +66,6 @@ memory = ConversationBufferWindowMemory(k=1, memory_key="chat_history", return_m
 
 wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
-async def wolfram_alpha_image_generator(query):
-    logger.info(f"Generating image with Wolfram Alpha for query: {query}")
-    response = await wolfram_client.aquery(query)
-    if hasattr(response, 'pod') and len(response.pod) > 0:
-        logger.info("Image generated successfully.")
-        response_text = 'HERE_IS_IMAGE:'
-        for image in response.pod:
-            response_text += f"\n{image.title}=>{image.subpod.img.src}"
-        return response_text
-    else:
-        logger.warning("Failed to generate image.")
-        return 'Failed to generate image.'
-    
-async def wolfram_alpha_data_generator(query):
-    logger.info(f"Queriying Wolfram Alpha for query: {query}")
-    response = await wolfram_client.aquery(query)
-    if hasattr(response, 'results') and len(response.results) > 0:
-        return next(response.results).text
-    else:
-        logger.warning("Failed to generate finding.")
-        return 'Failed to generate finding.'
-
 tools = [
     Tool(
         name="Expenses Interaction",
@@ -103,24 +81,6 @@ tools = [
         return_direct=True
     ),
     Tool(
-        name="Search the Web",
-        func=lambda query: json.dumps(requests.get(f"https://serpapi.com/search", params={"q": query, "api_key": SERP_API_KEY}).json(), indent=2),
-        description="Use this tool to search the web for information based on the user's query."
-    ),
-    Tool(
-        name="Wolfram Alpha",
-        func=lambda x: x,
-        description="Use this tool for computing and answering complex queries using Wolfram Alpha.",
-        coroutine=wolfram_alpha_data_generator,
-    ),
-    Tool(
-        name="Wolfram Alpha Image Generator",
-        func=lambda x: 'This tool must be awaited',
-        description="Use this tool to generate images for queries using Wolfram Alpha.",
-        return_direct=True,
-        coroutine=wolfram_alpha_image_generator
-    ),
-    Tool(
         name="Translation Tool",
         func=lambda x: 'This tool must be awaited',
         description="Use this tool to translate from one language to another.",
@@ -128,15 +88,25 @@ tools = [
     )
 ]
 
-agent = initialize_agent(
-    tools=tools, 
-    llm=llm, 
-    agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
-    memory=memory,
-    # handle_parsing_errors=True,
-    verbose=True,
-    debug=True
-)
+# Tool function with runtime-bound user_id
+async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
+    async def query_tool(query: str):
+        logger.info(f"Queriying Wolfram Alpha for query: {query}")
+        response = await wolfram_client.aquery(query)
+        if hasattr(response, 'pod'):
+            for pod in response.pod:
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
+        if hasattr(response, 'results'):
+            for result in response.results:
+                pass
+        return "Response completed."
+    
+    return Tool(
+        name="Wolfram Alpha Tool",
+        description="Wolfram Alpha Tool for complex or realtime queries.",
+        func=query_tool,
+        coroutine=query_tool
+    )
 
 # Start command
 @check_authorization
@@ -146,11 +116,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @check_authorization
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Initialize the tool here
+    tools_copy = tools.copy()
+    tools_copy.append(await make_wolfram_alpha_tool(update, context))
+    agent = initialize_agent(
+        tools=tools_copy, 
+        llm=llm, 
+        agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
+        memory=memory,
+        # handle_parsing_errors=True,
+        verbose=True
+    )
     text = update.message.text.strip()
     logger.info(f"Received chat message from user {update.effective_user.id}: {text}")
     sys_prompt = SYSTEM_PROMPT.copy()
     sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
     try:
+        await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
         response = await agent.ainvoke(prepend_system_prompt(text, sys_prompt))
         logger.info(f"Agent response: {response}")
         if 'output' in response and "HERE_IS_IMAGE" in response['output']:
