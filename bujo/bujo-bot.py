@@ -1,26 +1,23 @@
-from ast import mod, parse
-from types import coroutine
-from attr import has
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bujo.base import ALLOWED_USERS, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, SERP_API_KEY, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from bujo.base import TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from langchain.memory import ConversationBufferWindowMemory
-from langchain_core.messages import trim_messages
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 import requests
 from langchain.agents import initialize_agent, Tool
 from langchain.agents.agent_types import AgentType
 from datetime import datetime
 import wolframalpha
 from wakeonlan import send_magic_packet
-from langchain.prompts.chat import ChatPromptTemplate
 import logging
 import sys
-import json
 from typing import List, Dict
 import telegram
+from apscheduler.triggers.cron import CronTrigger
+import asyncio
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +159,44 @@ async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error sending magic packet: {e}")
         await update.message.reply_text(f"Waking up the PC: {e}")
 
+async def send_mag_message(bot: telegram.Bot):
+    """
+    Function to send a message to the MAG channel.
+    This can be scheduled to run periodically.
+    """
+    try:
+        mag_info_list = mag_manager.mag_model.list(json.dumps({"filters": [f"(Date,eq,exactDate,{datetime.now().strftime('%Y-%m-%d')})"]}))
+        if len(mag_info_list) == 0:
+            response = "No MAG entries found for today."
+            return
+        else:
+            mag_info = mag_info_list[0]
+            response = "Todays's MAG:\n" + \
+                f"**📅 Date:** {mag_info['Date']}\n" + \
+                f"**🌖 Tithi:** {mag_info['Tithi']}\n" 
+            
+            if mag_info['Note']:
+                response += f"**📝 Note:** {mag_info['Note']}\n"
+        # Replace with actual logic to fetch or generate the message
+        await bot.send_message(chat_id=CHAT_ID, text=response, parse_mode='markdown')
+        logger.info("Scheduled MAG message sent successfully.")
+    except Exception as e:
+        logger.error(f"Error sending scheduled MAG message: {e}")
+
+
+async def setup_scheduler(application):
+    scheduler.add_job(
+        send_mag_message,
+        CronTrigger(hour="*", minute="*", day="*", month="*", day_of_week="*"),
+        args=[application.bot]
+    )
+    scheduler.start()
+    logger.info("🕒 Scheduler started with 1-minute interval job.")
+
 # Main runner
 if __name__ == '__main__':
     logger.info("Starting the Telegram bot application.")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(setup_scheduler).build()
     
     # expense_add_handler = ConversationHandler(
     #     entry_points=[CommandHandler("add_expenses", expense_manager.start_add)],
@@ -202,6 +233,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
+
+    # Add Scheduled JObs
+    
     # app.add_handler(expense_add_handler)
     # app.add_handler(expenses_list_handler)
     # app.add_handler(modify_mag_handler)

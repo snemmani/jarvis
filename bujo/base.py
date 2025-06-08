@@ -1,5 +1,5 @@
-import cohere
 import os
+import sched
 
 from langchain_openai import ChatOpenAI
 from bujo.models.expenses import Expenses
@@ -7,10 +7,8 @@ from bujo.models.mag import MAG
 from dotenv import load_dotenv
 from functools import wraps
 from telegram.ext import ConversationHandler
-from telegram import Update
-from telegram.ext import ContextTypes
-import logging
 import json
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 #logging.basicConfig(
 #    level=logging.INFO,
@@ -36,6 +34,7 @@ SERP_API_KEY = os.environ["SERP_API_KEY"]
 WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
 BROADCAST_IP = os.environ["BROADCAST_IP"]
+CHAT_ID = os.environ["CHAT_ID"]
 # Initializations
 _original_create_chat_result = ChatOpenAI._create_chat_result
 
@@ -92,3 +91,5 @@ def check_authorization(func):
                 return await func(self, update, context, *args[3:], **kwargs)
         return wrapper
     
+# Scheduler part
+scheduler = AsyncIOScheduler()

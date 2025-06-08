@@ -8,3 +8,4 @@ langchain-openai
 wolframalpha
 wakeonlan
 langchain-xai
+apscheduler
