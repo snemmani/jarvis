@@ -187,11 +187,11 @@ async def send_mag_message(bot: telegram.Bot):
 async def setup_scheduler(application):
     scheduler.add_job(
         send_mag_message,
-        CronTrigger(hour="*", minute="*", day="*", month="*", day_of_week="*"),
+        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
         args=[application.bot]
     )
     scheduler.start()
-    logger.info("🕒 Scheduler started with 1-minute interval job.")
+    logger.info("🕒 Scheduler started for sending calendar at 8:00.")
 
 # Main runner
 if __name__ == '__main__':
