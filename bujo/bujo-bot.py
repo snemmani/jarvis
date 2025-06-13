@@ -91,7 +91,14 @@ async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_
         response = await wolfram_client.aquery(query)
         if hasattr(response, 'pod'):
             for pod in response.pod:
-                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
+                if type(response.pod) is list:
+                    for subpod in pod.subpod:
+                        if 'img' in subpod and '@src' in subpod['img']:
+                            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
+                        else:
+                            await context.bot.send_message(chat_id=update.effective_chat.id, text=pod['@title'])
+                else:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
         return "Response completed."
     
     return Tool(
