@@ -1,5 +1,6 @@
 FROM python:3.13-slim
 
+ENV TZ="Asia/Kolkata"
 # Set the working directory
 WORKDIR /app
 
