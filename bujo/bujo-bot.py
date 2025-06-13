@@ -16,7 +16,6 @@ import sys
 from typing import List, Dict
 import telegram
 from apscheduler.triggers.cron import CronTrigger
-import asyncio
 import json
 
 logger = logging.getLogger(__name__)
@@ -92,7 +91,14 @@ async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_
         response = await wolfram_client.aquery(query)
         if hasattr(response, 'pod'):
             for pod in response.pod:
-                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
+                if type(response.pod) is list:
+                    for subpod in pod.subpod:
+                        if 'img' in subpod and '@src' in subpod['img']:
+                            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
+                        else:
+                            await context.bot.send_message(chat_id=update.effective_chat.id, text=pod['@title'])
+                else:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
         return "Response completed."
     
     return Tool(
@@ -197,49 +203,10 @@ async def setup_scheduler(application):
 if __name__ == '__main__':
     logger.info("Starting the Telegram bot application.")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(setup_scheduler).build()
-    
-    # expense_add_handler = ConversationHandler(
-    #     entry_points=[CommandHandler("add_expenses", expense_manager.start_add)],
-    #     states={
-    #         ADD_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_expense_input)]
-    #     },
-    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    # )
-
-    # expenses_list_handler = ConversationHandler(
-    #     entry_points=[CommandHandler("list_expenses", expense_manager.start_list)],
-    #     states={
-    #         LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_manager.handle_list_input)]
-    #     },
-    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    # )
-
-    # modify_mag_handler = ConversationHandler(
-    #     entry_points=[CommandHandler("update_mag", mag_manager.start_modify)],
-    #     states={
-    #         UPDATE_MAG: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_mag_change)]
-    #     },
-    #     fallbacks=[CommandHandler("cancel", mag_manager.cancel)],
-    # )
-
-    # mag_list_handler = ConversationHandler(
-    #     entry_points=[CommandHandler("list_mag", mag_manager.start_list)],
-    #     states={
-    #         LIST_EXPENSE_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mag_manager.handle_list_input)]
-    #     },
-    #     fallbacks=[CommandHandler("cancel", expense_manager.cancel)],
-    # )
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
-
-    # Add Scheduled JObs
-    
-    # app.add_handler(expense_add_handler)
-    # app.add_handler(expenses_list_handler)
-    # app.add_handler(modify_mag_handler)
-    # app.add_handler(mag_list_handler)
 
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
