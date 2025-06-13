@@ -1,3 +1,4 @@
+from re import sub
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from bujo.base import TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID
@@ -90,15 +91,13 @@ async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_
         logger.info(f"Queriying Wolfram Alpha for query: {query}")
         response = await wolfram_client.aquery(query)
         if hasattr(response, 'pod'):
-            for pod in response.pod:
-                if type(response.pod) is list:
-                    for subpod in pod.subpod:
-                        if 'img' in subpod and '@src' in subpod['img']:
-                            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
-                        else:
-                            await context.bot.send_message(chat_id=update.effective_chat.id, text=pod['@title'])
+            for pod in response['pod']:
+                subpod = pod['subpod']
+                if type(subpod) is list:
+                    for item in subpod:
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=item['img']['@src'], caption=item['@title'])
                 else:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=pod.subpod['img']['@src'], caption=pod['@title'])
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
         return "Response completed."
     
     return Tool(
