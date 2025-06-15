@@ -18,6 +18,8 @@ from typing import List, Dict
 import telegram
 from apscheduler.triggers.cron import CronTrigger
 import json
+import ssl
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,25 @@ async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except requests.RequestException as e:
         logger.error(f"Error sending magic packet: {e}")
         await update.message.reply_text(f"Waking up the PC: {e}")
+        
+
+@check_authorization
+async def genPass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"GenPass triggered from user: {update.effective_user.id}")
+    try:
+        translation = str.maketrans('/=+-','abcd')
+        num_chars = int(context.args[0]) if context.args else 13
+        password = ""
+        for iter in range(num_chars//4):
+            password += f"{base64.b64encode(ssl.RAND_bytes(13)).decode('utf-8')[:4].translate(translation)}-"
+        
+        password = password.strip('-')[:num_chars]
+        await update.message.reply_text("🔑 Password Generated:")
+        await update.message.reply_text(password)
+        logger.info("Secure password generated.")
+    except requests.RequestException as e:
+        logger.error(f"Unable to Generate password: {e}")
+        await update.message.reply_text(f"Failed to generate password: {e}")
 
 async def send_mag_message(bot: telegram.Bot):
     """
@@ -206,6 +227,7 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
+    app.add_handler(CommandHandler("genPass", genPass, has_args=1))
 
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
