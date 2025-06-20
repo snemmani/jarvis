@@ -91,16 +91,20 @@ tools = [
 async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
     async def query_tool(query: str):
         logger.info(f"Queriying Wolfram Alpha for query: {query}")
-        response = await wolfram_client.aquery(query)
-        if hasattr(response, 'pod'):
-            for pod in response['pod']:
-                subpod = pod['subpod']
-                if type(subpod) is list:
-                    for item in subpod:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=item['img']['@src'], caption=item['@title'])
-                else:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
-        return "Response completed."
+        try:
+            response = await wolfram_client.aquery(query)
+            if hasattr(response, 'pod'):
+                for pod in response['pod']:
+                    subpod = pod['subpod']
+                    if type(subpod) is list:
+                        for item in subpod:
+                            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=item['img']['@src'], caption=item['@title'])
+                    else:
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
+            return "Response completed."
+        except Exception as e:
+            logger.error(f"Error querying Wolfram Alpha: {e}")
+            return "Wolfram Alpha cannot handle this request, LLM should handle this if it can."
     
     return Tool(
         name="Wolfram Alpha Tool",
