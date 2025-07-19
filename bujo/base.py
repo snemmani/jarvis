@@ -76,7 +76,10 @@ def check_authorization(func):
                 context = args[1]
                 user_id = update.effective_user.id
                 if user_id not in ALLOWED_USERS:
+                    message_id = update.message.message_id
                     await update.message.reply_text("🚫 You're not authorized to use this bot.")
+                    await context.bot.forward_message(chat_id=CHAT_ID, from_chat_id=update.effective_chat.id, message_id=message_id)
+                    await context.bot.send_message(chat_id=CHAT_ID, text="Got above message from another user")
                     return ConversationHandler.END
                 return await func(*args, **kwargs)
 
@@ -86,7 +89,10 @@ def check_authorization(func):
                 context = args[2]
                 user_id = update.effective_user.id
                 if user_id not in ALLOWED_USERS:
+                    message_id = update.message.message_id
                     await update.message.reply_text("🚫 You're not authorized to use this bot.")
+                    await context.bot.forward_message(chat_id=CHAT_ID, from_chat_id=update.effective_chat.id, message_id=message_id)
+                    await context.bot.send_message(chat_id=CHAT_ID, text="Got above message from another user")
                     return ConversationHandler.END
                 return await func(self, update, context, *args[3:], **kwargs)
         return wrapper
