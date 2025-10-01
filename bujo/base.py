@@ -2,6 +2,7 @@ import os
 import sched
 
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 ALLOWED_USERS = [int(os.environ["TELEGRAM_USER_ID"])]
 # COHERE_MODEL = os.environ["COHERE_MODEL"]
 OPENAI_MODEL = os.environ["OPENAI_MODEL"]
+TEXT_TO_SPEECH_MODEL = os.environ["TEXT_TO_SPEECH_MODEL"]
 NOCODB_BASE_URL = os.environ["NOCODB_BASE_URL"]
 
 # Secrets
@@ -56,6 +58,7 @@ def patched_create_chat_result(self, response, generation_info):
 ChatOpenAI._create_chat_result = patched_create_chat_result
 
 llm = ChatOpenAI(model=OPENAI_MODEL)
+openai_model = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
 expenses_model = Expenses(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_EXPENSES_TABLE_ID, NOCODB_EXPENSES_MAG_LINK_ID, mag_model)
 expense_add_messages=[
