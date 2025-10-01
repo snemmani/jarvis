@@ -9,3 +9,4 @@ wolframalpha
 wakeonlan
 langchain-xai
 apscheduler
+litellm
