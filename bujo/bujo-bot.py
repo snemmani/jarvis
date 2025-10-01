@@ -1,10 +1,13 @@
+import os
 from hmac import new
 from re import sub
 import trace
 from litellm import transcription
+import openai
 from telegram import Update
+import base64
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from bujo.base import TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID, openai_model, TEXT_TO_SPEECH_MODEL
+from bujo.base import OPENAI_MODEL, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID, openai_model, TEXT_TO_SPEECH_MODEL
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from langchain.memory import ConversationBufferWindowMemory
@@ -124,6 +127,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @check_authorization
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    await agent_engage(update, context, text)
+
+async def agent_engage(update, context, text):
     # Initialize the tool here
     tools_copy = tools.copy()
     tools_copy.append(await make_wolfram_alpha_tool(update, context))
@@ -135,7 +142,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # handle_parsing_errors=True,
         verbose=True
     )
-    text = update.message.text.strip()
     logger.info(f"Received chat message from user {update.effective_user.id}: {text}")
     sys_prompt = SYSTEM_PROMPT.copy()
     sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
@@ -164,17 +170,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @check_authorization
 async def voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Initialize the tool here
-    tools_copy = tools.copy()
-    tools_copy.append(await make_wolfram_alpha_tool(update, context))
-    agent = initialize_agent(
-        tools=tools_copy, 
-        llm=llm, 
-        agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
-        memory=memory,
-        # handle_parsing_errors=True,
-        verbose=True
-    )
     voice = update.message.voice.file_id
     new_file = await context.bot.get_file(voice)
     file_path = f"{voice}.ogg"
@@ -188,31 +183,37 @@ async def voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     text = transcript.text.strip()
-    logger.info(f"Received chat message from user {update.effective_user.id}: {text}")
-    sys_prompt = SYSTEM_PROMPT.copy()
-    sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
-    try:
-        await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
-        response = await agent.ainvoke(prepend_system_prompt(text, sys_prompt))
-        logger.info(f"Agent response: {response}")
-        if 'output' in response and "HERE_IS_IMAGE" in response['output']:
-            try:
-                images_data = response['output'].split('\n')
-                for image in images_data[1:]:
-                    title, image_url = image.split('=>')
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url, caption=title)
-                logger.info(f"Sent images to user {update.effective_user.id}: {image_url}")
-            except Exception as e:
-                logger.error(f"Error generating image: {e}")
-                await update.message.reply_text(f"Error generating image: {e}")
-        else:
-            await update.message.reply_text(
-                response['output'],
-                parse_mode='markdown',
-            )
-    except Exception as e:
-        logger.error(f"Error in chat handler: {e}")
-        await update.message.reply_text(f"An error occurred: {e}")
+    await agent_engage(update, context, text)
+
+@check_authorization
+async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    image = update.message.photo[-1]
+    text = update.message.caption if update.message.caption else ""
+    file_info = await context.bot.get_file(image)
+    file_name = os.path.basename(file_info.file_path) if file_info.file_path else f"{image.file_id}.jpg"
+
+    await file_info.download_to_drive(file_name)
+
+    with open(file_name, "rb") as image_file:
+        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+    response = openai_model.responses.create(
+        model=OPENAI_MODEL,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Summarize the image content in a single sentence.\nExcept if it is a transaction.\nIf it is a transaction, Provide response as below message.\nSpent <amount> on <item|whoever the money was sent to> on <date>.\nIf date is not present, assume today\'s date.\nIf amount is not present, assume it is zero.\nIf item is not present, assume it is miscellaneous."},
+                {"type": "input_text", "text": "The caption of the Image is: " + text +" so assume the caption is the <item> for this transaction"} if text else {"type": "input_text", "text": "No caption provided."},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{base64_image}",
+                },
+            ],
+        }]
+    )
+
+    await agent_engage(update, context, response.output_text)
+
 
 @check_authorization
 async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,6 +286,7 @@ if __name__ == '__main__':
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, voice))
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, image))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
