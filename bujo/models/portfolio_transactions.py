@@ -24,8 +24,8 @@ class PortfolioTransactions:
         }
         self.transactions_url = f"{self.base_url}/api/v2/tables/{self.table_id}/records"
 
-    def _url(self, path: str = "") -> str:
-        return f"{self.base_url}/api/v2/tables/{self.table_id}/records{path}"
+    def _url(self, path: str = "", version=2) -> str:
+        return f"{self.base_url}/api/v{version}/tables/{self.table_id}/records{path}"
 
     def create(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         response = requests.post(self._url(), json=data, headers=self.headers)
@@ -42,8 +42,11 @@ class PortfolioTransactions:
         print("❌ Read failed:", response.status_code, response.text)
         return None
 
-    def update(self, record_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        response = requests.patch(self._url(f"/{record_id}"), json=data, headers=self.headers)
+    def update(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        allowed_keys = {"Id", "Ticker", "TransactionType", "NoOfShares", "CostPerShare","CMP"}
+        filtered_data = {key: value for key, value in data.items() if key in allowed_keys}
+        response = requests.patch(self._url(), json=filtered_data, headers=self.headers)
+        
         if response.ok:
             return response.json()
         print("❌ Update failed:", response.status_code, response.text)

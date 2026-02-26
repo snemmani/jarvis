@@ -1,6 +1,7 @@
 import os
 from hmac import new
 from re import sub
+from tabnanny import check
 import trace
 from litellm import transcription
 import openai
@@ -293,7 +294,7 @@ async def get_cmp_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for tx in transactions:
                     if tx.get('Ticker') == ticker:
                         tx['CMP'] = cmp
-                        portfolio_transactions_model.update(tx['Id'],tx)
+                        portfolio_transactions_model.update(tx)
                         
                 
                 logger.info(f"Updated CMP for ticker {ticker}: {cmp}")
@@ -304,18 +305,290 @@ async def get_cmp_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in get_cmp_today: {e}")
 
+@check_authorization
+async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+
+        # ── 1. Fetch all transactions ────────────────────────────────────────────
+        transactions = portfolio_transactions_model.list()
+        if not transactions:
+            await update.message.reply_text("📭 No portfolio transactions found.")
+            return
+
+        # ── 2. Fetch USD → INR conversion rate via yfinance ──────────────────────
+        usd_inr_ticker = yf.Ticker("USDINR=X")
+        usd_to_inr = usd_inr_ticker.info.get("regularMarketPrice") or usd_inr_ticker.fast_info.get("lastPrice", 84.0)
+        logger.info(f"USD → INR rate: {usd_to_inr}")
+
+        # ── 3. Aggregate per ticker ──────────────────────────────────────────────
+        # ticker_data[ticker] = {
+        #   "currency": "INR" | "USD",
+        #   "total_bought": float,   # total shares bought
+        #   "total_sold": float,     # total shares sold
+        #   "buy_cost_inr": float,   # weighted cost basis in INR
+        #   "sell_proceeds_inr": float,
+        #   "cmp_inr": float,        # latest CMP in INR
+        # }
+        ticker_data: Dict[str, Dict] = {}
+
+        for tx in transactions:
+            ticker    = tx.get("Ticker", "").strip()
+            tx_type   = tx.get("TransactionType", "").strip()   # "Buy" or "Sell"
+            shares    = float(tx.get("NoOfShares") or 0)
+            cost      = float(tx.get("CostPerShare") or 0)
+            cmp       = float(tx.get("CMP") or 0)
+
+            if not ticker or shares == 0:
+                continue
+
+            is_inr    = ticker.upper().endswith(".NS")
+            currency  = "INR" if is_inr else "USD"
+            fx        = 1.0 if is_inr else usd_to_inr
+
+            if ticker not in ticker_data:
+                ticker_data[ticker] = {
+                    "currency": currency,
+                    "total_bought": 0.0,
+                    "total_sold": 0.0,
+                    "buy_cost_inr": 0.0,
+                    "sell_proceeds_inr": 0.0,
+                    "cmp_inr": cmp * fx,
+                }
+
+            # Always keep the latest CMP (last row wins – same as get_cmp_today logic)
+            if cmp:
+                ticker_data[ticker]["cmp_inr"] = cmp * fx
+
+            if tx_type == "Buy":
+                ticker_data[ticker]["total_bought"]  += shares
+                ticker_data[ticker]["buy_cost_inr"]  += shares * cost * fx
+            elif tx_type == "Sell":
+                ticker_data[ticker]["total_sold"]     += shares
+                ticker_data[ticker]["sell_proceeds_inr"] += shares * cost * fx
+
+        # ── 4. Classify tickers & compute P&L ───────────────────────────────────
+        open_tickers:   List[Dict] = []
+        closed_tickers: List[Dict] = []
+
+        for ticker, d in ticker_data.items():
+            net_shares   = d["total_bought"] - d["total_sold"]
+            avg_cost_inr = (d["buy_cost_inr"] / d["total_bought"]) if d["total_bought"] else 0.0
+            cmp_inr      = d["cmp_inr"]
+
+            if net_shares > 0:
+                # ── OPEN position ────────────────────────────────────────────────
+                current_value_inr  = net_shares * cmp_inr
+                invested_value_inr = net_shares * avg_cost_inr
+                unrealised_pl      = current_value_inr - invested_value_inr
+                unrealised_pct     = (unrealised_pl / invested_value_inr * 100) if invested_value_inr else 0.0
+
+                # Realised P&L from partial sells (if any)
+                realised_pl = d["sell_proceeds_inr"] - (d["total_sold"] * avg_cost_inr)
+
+                open_tickers.append({
+                    "ticker":           ticker,
+                    "currency":         d["currency"],
+                    "net_shares":       net_shares,
+                    "avg_cost_inr":     avg_cost_inr,
+                    "cmp_inr":          cmp_inr,
+                    "invested_inr":     invested_value_inr,
+                    "current_inr":      current_value_inr,
+                    "unrealised_pl":    unrealised_pl,
+                    "unrealised_pct":   unrealised_pct,
+                    "realised_pl":      realised_pl,
+                })
+            else:
+                # ── CLOSED position (fully sold) ─────────────────────────────────
+                realised_pl  = d["sell_proceeds_inr"] - d["buy_cost_inr"]
+                realised_pct = (realised_pl / d["buy_cost_inr"] * 100) if d["buy_cost_inr"] else 0.0
+
+                closed_tickers.append({
+                    "ticker":        ticker,
+                    "currency":      d["currency"],
+                    "buy_cost_inr":  d["buy_cost_inr"],
+                    "sell_inr":      d["sell_proceeds_inr"],
+                    "realised_pl":   realised_pl,
+                    "realised_pct":  realised_pct,
+                })
+
+        # ── 5. Build the Telegram message ────────────────────────────────────────
+        def fmt_inr(val: float) -> str:
+            """Format a rupee value with ₹ sign and comma separators."""
+            return f"₹{val:,.2f}"
+
+        def fmt_usd(val: float) -> str:
+            """Format a dollar value with $ sign and comma separators."""
+            return f"${val:,.2f}"
+
+        def pl_emoji(val: float) -> str:
+            return "🟢" if val >= 0 else "🔴"
+
+        def build_section(
+            section_open: List[Dict],
+            section_closed: List[Dict],
+            is_usd: bool,
+        ) -> List[str]:
+            """Build lines for one currency bucket (INR or USD)."""
+            fmt      = fmt_usd if is_usd else fmt_inr
+            # For USD tickers the stored values are already in INR (multiplied by fx),
+            # but we want to display them in USD for clarity.
+            fx_div   = usd_to_inr if is_usd else 1.0
+            sec_lines: List[str] = []
+
+            # ── Open ─────────────────────────────────────────────────────────────
+            if section_open:
+                inv_total  = sum(t["invested_inr"] for t in section_open)
+                cur_total  = sum(t["current_inr"]  for t in section_open)
+                unreal_tot = cur_total - inv_total
+                real_open  = sum(t["realised_pl"]  for t in section_open)
+
+                sec_lines.append(f"📂 *Open* ({len(section_open)})")
+                sec_lines.append("─────────────────────────────")
+
+                for t in sorted(section_open, key=lambda x: x["unrealised_pl"], reverse=True):
+                    emoji = pl_emoji(t["unrealised_pl"])
+                    avg   = t["avg_cost_inr"]  / fx_div
+                    cmp   = t["cmp_inr"]       / fx_div
+                    inv   = t["invested_inr"]  / fx_div
+                    cur   = t["current_inr"]   / fx_div
+                    upl   = t["unrealised_pl"] / fx_div
+                    rpl   = t["realised_pl"]   / fx_div
+                    sec_lines.append(
+                        f"{emoji} *{t['ticker']}*\n"
+                        f"   Shares: `{t['net_shares']:.4f}` | Avg Cost: {fmt(avg)}\n"
+                        f"   CMP: {fmt(cmp)} | Invested: {fmt(inv)}\n"
+                        f"   Current: {fmt(cur)} | "
+                        f"Unrealised: {fmt(upl)} ({t['unrealised_pct']:+.2f}%)"
+                        + (f"\n   Realised (partial): {fmt(rpl)}" if t["realised_pl"] != 0 else "")
+                    )
+
+                sec_lines.append("─────────────────────────────")
+                sec_lines.append(
+                    f"📌 *Open Totals*\n"
+                    f"   Invested: {fmt(inv_total / fx_div)}\n"
+                    f"   Current:  {fmt(cur_total / fx_div)}\n"
+                    f"   {pl_emoji(unreal_tot)} Unrealised P&L: {fmt(unreal_tot / fx_div)} "
+                    f"({(unreal_tot / inv_total * 100) if inv_total else 0:+.2f}%)"
+                    + (f"\n   Realised (partial sells): {fmt(real_open / fx_div)}" if real_open else "")
+                )
+            else:
+                sec_lines.append("📂 *Open Positions:* None")
+
+            # ── Closed ───────────────────────────────────────────────────────────
+            if section_closed:
+                buy_tot  = sum(t["buy_cost_inr"] for t in section_closed)
+                sell_tot = sum(t["sell_inr"]      for t in section_closed)
+                real_tot = sell_tot - buy_tot
+
+                sec_lines.append("")
+                sec_lines.append(f"✅ *Closed* ({len(section_closed)})")
+                sec_lines.append("─────────────────────────────")
+
+                for t in sorted(section_closed, key=lambda x: x["realised_pl"], reverse=True):
+                    emoji = pl_emoji(t["realised_pl"])
+                    sec_lines.append(
+                        f"{emoji} *{t['ticker']}*\n"
+                        f"   Invested: {fmt(t['buy_cost_inr'] / fx_div)} | Sold: {fmt(t['sell_inr'] / fx_div)}\n"
+                        f"   Realised P&L: {fmt(t['realised_pl'] / fx_div)} ({t['realised_pct']:+.2f}%)"
+                    )
+
+                sec_lines.append("─────────────────────────────")
+                sec_lines.append(
+                    f"📌 *Closed Totals*\n"
+                    f"   Total Invested: {fmt(buy_tot / fx_div)}\n"
+                    f"   Total Sold:     {fmt(sell_tot / fx_div)}\n"
+                    f"   {pl_emoji(real_tot)} Realised P&L: {fmt(real_tot / fx_div)} "
+                    f"({(real_tot / buy_tot * 100) if buy_tot else 0:+.2f}%)"
+                )
+            else:
+                sec_lines.append("\n✅ *Closed Positions:* None")
+
+            return sec_lines
+
+        # ── Split by currency ─────────────────────────────────────────────────────
+        inr_open   = [t for t in open_tickers   if t["currency"] == "INR"]
+        inr_closed = [t for t in closed_tickers if t["currency"] == "INR"]
+        usd_open   = [t for t in open_tickers   if t["currency"] == "USD"]
+        usd_closed = [t for t in closed_tickers if t["currency"] == "USD"]
+
+        lines: List[str] = []
+
+        # ── Header ───────────────────────────────────────────────────────────────
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📊 *Portfolio P&L Summary*")
+        lines.append(f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
+        lines.append(f"💱 USD → INR: ₹{usd_to_inr:.2f}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── 🇮🇳 INR Section ───────────────────────────────────────────────────────
+        lines.append("")
+        lines.append("🇮🇳 *Indian Portfolio (INR)*")
+        lines.extend(build_section(inr_open, inr_closed, is_usd=False))
+
+        # INR section subtotal
+        inr_invested = sum(t["invested_inr"] for t in inr_open)   + sum(t["buy_cost_inr"] for t in inr_closed)
+        inr_current  = sum(t["current_inr"]  for t in inr_open)   + sum(t["sell_inr"]     for t in inr_closed)
+        inr_pl       = inr_current - inr_invested
+        lines.append("")
+        lines.append(
+            f"🏦 *INR Net*: {fmt_inr(inr_invested)} → {fmt_inr(inr_current)}  "
+            f"{pl_emoji(inr_pl)} {fmt_inr(inr_pl)} "
+            f"({(inr_pl / inr_invested * 100) if inr_invested else 0:+.2f}%)"
+        )
+
+        # ── 🇺🇸 USD Section ───────────────────────────────────────────────────────
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🇺🇸 *US Portfolio (USD)*")
+        lines.extend(build_section(usd_open, usd_closed, is_usd=True))
+
+        # USD section subtotal (shown in both USD and INR equivalent)
+        usd_invested_inr = sum(t["invested_inr"] for t in usd_open)   + sum(t["buy_cost_inr"] for t in usd_closed)
+        usd_current_inr  = sum(t["current_inr"]  for t in usd_open)   + sum(t["sell_inr"]     for t in usd_closed)
+        usd_pl_inr       = usd_current_inr - usd_invested_inr
+        lines.append("")
+        lines.append(
+            f"🏦 *USD Net*: {fmt_usd(usd_invested_inr / usd_to_inr)} → {fmt_usd(usd_current_inr / usd_to_inr)}  "
+            f"{pl_emoji(usd_pl_inr)} {fmt_usd(usd_pl_inr / usd_to_inr)} "
+            f"({(usd_pl_inr / usd_invested_inr * 100) if usd_invested_inr else 0:+.2f}%)\n"
+            f"   _(≈ {fmt_inr(usd_invested_inr)} → {fmt_inr(usd_current_inr)}, P&L {fmt_inr(usd_pl_inr)})_"
+        )
+
+        # ── Grand Total (everything in INR) ──────────────────────────────────────
+        all_invested = inr_invested + usd_invested_inr
+        all_current  = inr_current  + usd_current_inr
+        grand_pl     = all_current  - all_invested
+
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(
+            f"💼 *Grand Total (INR equivalent)*\n"
+            f"   Total Invested: {fmt_inr(all_invested)}\n"
+            f"   Total Value:    {fmt_inr(all_current)}\n"
+            f"   {pl_emoji(grand_pl)} Overall P&L: {fmt_inr(grand_pl)} "
+            f"({(grand_pl / all_invested * 100) if all_invested else 0:+.2f}%)"
+        )
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        message = "\n".join(lines)
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+        logger.info("P&L summary sent successfully.")
+
+    except Exception as e:
+        logger.error(f"Error in get_profit_loss: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Error generating P&L report: {e}")
+
 
 async def setup_scheduler(application):
-#     scheduler.add_job(
-#         send_mag_message,
-#         # get_cmp_today,
-# #        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
-#         #  CronTrigger(hour="*", minute="*", day="*", month="*", day_of_week="*"),
-#         args=[application.bot]
-#     )
-#     scheduler.start()
-#     logger.info("🕒 Scheduler started for sending calendar at 8:00.")
-    pass
+    scheduler.add_job(
+        send_mag_message,
+        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
+        args=[application.bot]
+    )
+    scheduler.start()
+    logger.info("🕒 Scheduler started for sending calendar at 8:00.")
 
 # Main runner
 if __name__ == '__main__':
@@ -329,6 +602,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
+    app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
     app.run_polling()
