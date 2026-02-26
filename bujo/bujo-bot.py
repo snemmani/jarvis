@@ -323,6 +323,7 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── 3. Aggregate per ticker ──────────────────────────────────────────────
         # ticker_data[ticker] = {
+        #   "portfolio": str,        # Portfolio name
         #   "currency": "INR" | "USD",
         #   "total_bought": float,   # total shares bought
         #   "total_sold": float,     # total shares sold
@@ -338,6 +339,7 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shares    = float(tx.get("NoOfShares") or 0)
             cost      = float(tx.get("CostPerShare") or 0)
             cmp       = float(tx.get("CMP") or 0)
+            portfolio = tx.get("Portfolio", "Unknown").strip()
 
             if not ticker or shares == 0:
                 continue
@@ -348,6 +350,7 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if ticker not in ticker_data:
                 ticker_data[ticker] = {
+                    "portfolio": portfolio,
                     "currency": currency,
                     "total_bought": 0.0,
                     "total_sold": 0.0,
@@ -506,11 +509,21 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return sec_lines
 
-        # ── Split by currency ─────────────────────────────────────────────────────
-        inr_open   = [t for t in open_tickers   if t["currency"] == "INR"]
-        inr_closed = [t for t in closed_tickers if t["currency"] == "INR"]
-        usd_open   = [t for t in open_tickers   if t["currency"] == "USD"]
-        usd_closed = [t for t in closed_tickers if t["currency"] == "USD"]
+        # ── Split by portfolio ────────────────────────────────────────────────────
+        # Create a dict mapping portfolio name to {open, closed} tickers
+        portfolios: Dict[str, Dict[str, List]] = {}
+        
+        for ticker, d in ticker_data.items():
+            portfolio = d["portfolio"]
+            if portfolio not in portfolios:
+                portfolios[portfolio] = {"open": [], "closed": []}
+            
+            # Determine if this ticker is open or closed
+            net_shares = d["total_bought"] - d["total_sold"]
+            if net_shares > 0:
+                portfolios[portfolio]["open"].append(ticker)
+            else:
+                portfolios[portfolio]["closed"].append(ticker)
 
         lines: List[str] = []
 
@@ -521,53 +534,82 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"💱 USD → INR: ₹{usd_to_inr:.2f}")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        # ── 🇮🇳 INR Section ───────────────────────────────────────────────────────
-        lines.append("")
-        lines.append("🇮🇳 *Indian Portfolio (INR)*")
-        lines.extend(build_section(inr_open, inr_closed, is_usd=False))
-
-        # INR section subtotal
-        inr_invested = sum(t["invested_inr"] for t in inr_open)   + sum(t["buy_cost_inr"] for t in inr_closed)
-        inr_current  = sum(t["current_inr"]  for t in inr_open)   + sum(t["sell_inr"]     for t in inr_closed)
-        inr_pl       = inr_current - inr_invested
-        lines.append("")
-        lines.append(
-            f"🏦 *INR Net*: {fmt_inr(inr_invested)} → {fmt_inr(inr_current)}  "
-            f"{pl_emoji(inr_pl)} {fmt_inr(inr_pl)} "
-            f"({(inr_pl / inr_invested * 100) if inr_invested else 0:+.2f}%)"
-        )
-
-        # ── 🇺🇸 USD Section ───────────────────────────────────────────────────────
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🇺🇸 *US Portfolio (USD)*")
-        lines.extend(build_section(usd_open, usd_closed, is_usd=True))
-
-        # USD section subtotal (shown in both USD and INR equivalent)
-        usd_invested_inr = sum(t["invested_inr"] for t in usd_open)   + sum(t["buy_cost_inr"] for t in usd_closed)
-        usd_current_inr  = sum(t["current_inr"]  for t in usd_open)   + sum(t["sell_inr"]     for t in usd_closed)
-        usd_pl_inr       = usd_current_inr - usd_invested_inr
-        lines.append("")
-        lines.append(
-            f"🏦 *USD Net*: {fmt_usd(usd_invested_inr / usd_to_inr)} → {fmt_usd(usd_current_inr / usd_to_inr)}  "
-            f"{pl_emoji(usd_pl_inr)} {fmt_usd(usd_pl_inr / usd_to_inr)} "
-            f"({(usd_pl_inr / usd_invested_inr * 100) if usd_invested_inr else 0:+.2f}%)\n"
-            f"   _(≈ {fmt_inr(usd_invested_inr)} → {fmt_inr(usd_current_inr)}, P&L {fmt_inr(usd_pl_inr)})_"
-        )
+        # ── Process each portfolio ────────────────────────────────────────────────
+        grand_invested = 0.0
+        grand_current = 0.0
+        
+        for portfolio_name in sorted(portfolios.keys()):
+            portfolio_data = portfolios[portfolio_name]
+            portfolio_open_tickers = [open_tickers[i] for i, t in enumerate(open_tickers) if t["ticker"] in portfolio_data["open"]]
+            portfolio_closed_tickers = [closed_tickers[i] for i, t in enumerate(closed_tickers) if t["ticker"] in portfolio_data["closed"]]
+            
+            lines.append("")
+            lines.append(f"💼 *{portfolio_name}*")
+            
+            # Determine if portfolio has both INR and USD or just one
+            has_inr = any(t["currency"] == "INR" for t in portfolio_open_tickers + portfolio_closed_tickers)
+            has_usd = any(t["currency"] == "USD" for t in portfolio_open_tickers + portfolio_closed_tickers)
+            
+            port_invested = 0.0
+            port_current = 0.0
+            
+            # Build sections for INR tickers in this portfolio
+            if has_inr:
+                inr_open = [t for t in portfolio_open_tickers if t["currency"] == "INR"]
+                inr_closed = [t for t in portfolio_closed_tickers if t["currency"] == "INR"]
+                if inr_open or inr_closed:
+                    lines.append("🇮🇳 *Indian Stocks (INR)*")
+                    lines.extend(build_section(inr_open, inr_closed, is_usd=False))
+                    
+                    inr_invested = sum(t["invested_inr"] for t in inr_open) + sum(t["buy_cost_inr"] for t in inr_closed)
+                    inr_current = sum(t["current_inr"] for t in inr_open) + sum(t["sell_inr"] for t in inr_closed)
+                    inr_pl = inr_current - inr_invested
+                    port_invested += inr_invested
+                    port_current += inr_current
+                    grand_invested += inr_invested
+                    grand_current += inr_current
+                    
+                    lines.append(f"   🏦 INR Subtotal: {fmt_inr(inr_invested)} → {fmt_inr(inr_current)}  {pl_emoji(inr_pl)} {fmt_inr(inr_pl)}")
+            
+            # Build sections for USD tickers in this portfolio
+            if has_usd:
+                usd_open = [t for t in portfolio_open_tickers if t["currency"] == "USD"]
+                usd_closed = [t for t in portfolio_closed_tickers if t["currency"] == "USD"]
+                if usd_open or usd_closed:
+                    lines.append("🇺🇸 *US Stocks (USD)*")
+                    lines.extend(build_section(usd_open, usd_closed, is_usd=True))
+                    
+                    usd_invested_inr = sum(t["invested_inr"] for t in usd_open) + sum(t["buy_cost_inr"] for t in usd_closed)
+                    usd_current_inr = sum(t["current_inr"] for t in usd_open) + sum(t["sell_inr"] for t in usd_closed)
+                    usd_pl_inr = usd_current_inr - usd_invested_inr
+                    port_invested += usd_invested_inr
+                    port_current += usd_current_inr
+                    grand_invested += usd_invested_inr
+                    grand_current += usd_current_inr
+                    
+                    lines.append(f"   🏦 USD Subtotal: {fmt_usd(usd_invested_inr / usd_to_inr)} → {fmt_usd(usd_current_inr / usd_to_inr)}  {pl_emoji(usd_pl_inr)} {fmt_usd(usd_pl_inr / usd_to_inr)}")
+            
+            # Portfolio total
+            port_pl = port_current - port_invested
+            
+            lines.append("─────────────────────────────")
+            lines.append(
+                f"📌 *{portfolio_name} Total*: {fmt_inr(port_invested)} → {fmt_inr(port_current)}  "
+                f"{pl_emoji(port_pl)} {fmt_inr(port_pl)} "
+                f"({(port_pl / port_invested * 100) if port_invested else 0:+.2f}%)"
+            )
 
         # ── Grand Total (everything in INR) ──────────────────────────────────────
-        all_invested = inr_invested + usd_invested_inr
-        all_current  = inr_current  + usd_current_inr
-        grand_pl     = all_current  - all_invested
+        grand_pl = grand_current - grand_invested
 
         lines.append("")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(
             f"💼 *Grand Total (INR equivalent)*\n"
-            f"   Total Invested: {fmt_inr(all_invested)}\n"
-            f"   Total Value:    {fmt_inr(all_current)}\n"
+            f"   Total Invested: {fmt_inr(grand_invested)}\n"
+            f"   Total Value:    {fmt_inr(grand_current)}\n"
             f"   {pl_emoji(grand_pl)} Overall P&L: {fmt_inr(grand_pl)} "
-            f"({(grand_pl / all_invested * 100) if all_invested else 0:+.2f}%)"
+            f"({(grand_pl / grand_invested * 100) if grand_invested else 0:+.2f}%)"
         )
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -582,13 +624,45 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setup_scheduler(application):
+    # Wrapper for get_cmp_today to work with scheduler
+    async def scheduled_get_cmp_today():
+        try:
+            # Get unique tickers from transactions table
+            transactions = portfolio_transactions_model.list()
+            tickers = set(tx.get('Ticker') for tx in transactions if tx.get('Ticker'))
+            
+            if not tickers:
+                logger.info("No tickers found in transactions table.")
+                return
+            
+            # Fetch current market prices and update transactions
+            for ticker in tickers:
+                data = yf.Ticker(ticker)
+                cmp = data.info.get('currentPrice', 0)
+                
+                # Update all rows with this ticker
+                for tx in transactions:
+                    if tx.get('Ticker') == ticker:
+                        tx['CMP'] = cmp
+                        portfolio_transactions_model.update(tx)
+                
+                logger.info(f"Updated CMP for ticker {ticker}: {cmp}")
+            
+            await application.bot.send_message(chat_id=CHAT_ID, text="✅ CMP values updated for all tickers.", parse_mode='markdown')
+        except Exception as e:
+            logger.error(f"Error in scheduled get_cmp_today: {e}")
+    
     scheduler.add_job(
         send_mag_message,
         CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
         args=[application.bot]
     )
+    scheduler.add_job(
+        scheduled_get_cmp_today,
+        CronTrigger(hour="8", minute="15", day="*", month="*", day_of_week="0-4"),
+    )
     scheduler.start()
-    logger.info("🕒 Scheduler started for sending calendar at 8:00.")
+    logger.info("🕒 Scheduler started for sending calendar at 8:00 and updating CMP at 8:15 (Mon-Fri).")
 
 # Main runner
 if __name__ == '__main__':
