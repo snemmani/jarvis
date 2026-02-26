@@ -1,10 +1,10 @@
 from datetime import datetime
 from bujo.base import llm
 from bujo.models.mag import MAG
-from langchain.agents import initialize_agent, Tool
-from langchain.agents.agent_types import AgentType
+from langchain_classic.agents import Tool, initialize_agent
+from langchain_classic.agents.agent_types import AgentType
 from datetime import datetime
-from langchain.memory import ConversationBufferWindowMemory
+from langchain_classic.memory import ConversationBufferWindowMemory
 import logging
 from typing import List, Dict
 

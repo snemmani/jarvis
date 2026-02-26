@@ -5,6 +5,7 @@ from langchain_openai import ChatOpenAI
 from openai import OpenAI
 from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
+from bujo.models.portfolio_transactions import PortfolioTransactions
 from dotenv import load_dotenv
 from functools import wraps
 from telegram.ext import ConversationHandler
@@ -29,6 +30,7 @@ NOCODB_BASE_URL = os.environ["NOCODB_BASE_URL"]
 # COHERE_API_KEY = os.environ['COHERE_API_KEY']
 NOCODB_API_TOKEN = os.environ['NOCODB_API_TOKEN']
 NOCODB_EXPENSES_TABLE_ID = os.environ["NOCODB_EXPENSES_TABLE_ID"]
+NOCODB_TRANSACTIONS_TABLE_ID = os.environ["NOCODB_TRANSACTIONS_TABLE_ID"]
 NOCODB_MAG_TABLE_ID = os.environ["NOCODB_MAG_TABLE_ID"]
 NOCODB_EXPENSES_MAG_LINK_ID = os.environ["NOCODB_EXPENSES_MAG_LINK_ID"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -61,6 +63,7 @@ llm = ChatOpenAI(model=OPENAI_MODEL)
 openai_model = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
 expenses_model = Expenses(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_EXPENSES_TABLE_ID, NOCODB_EXPENSES_MAG_LINK_ID, mag_model)
+portfolio_transactions_model = PortfolioTransactions(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_TRANSACTIONS_TABLE_ID)
 expense_add_messages=[
     {'role': 'system', 'content': 'You are an expert freetext to python serializer'},
     {'role': 'system', 'content': 'There are following fields in expenses schema: date, item, amount'},

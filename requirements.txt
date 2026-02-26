@@ -10,3 +10,5 @@ wakeonlan
 langchain-xai
 apscheduler
 litellm
+yfinance
+debugpy

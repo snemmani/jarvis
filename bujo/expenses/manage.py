@@ -4,11 +4,12 @@ from math import log
 from bujo.models.expenses import Expenses
 from bujo.models.mag import MAG
 from bujo.base import llm
-from langchain.agents import initialize_agent, Tool
+from langchain_core.tools import Tool
+from langchain_classic.agents import initialize_agent
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents.agent_types import AgentType
+from langchain_classic.memory import ConversationBufferWindowMemory
+from langchain_classic.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_classic.agents.agent_types import AgentType
 from datetime import datetime
 import json
 from typing import List, Dict

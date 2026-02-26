@@ -7,14 +7,14 @@ import openai
 from telegram import Update
 import base64
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from bujo.base import OPENAI_MODEL, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID, openai_model, TEXT_TO_SPEECH_MODEL
+from bujo.base import OPENAI_MODEL, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID, openai_model, TEXT_TO_SPEECH_MODEL, portfolio_transactions_model
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
-from langchain.memory import ConversationBufferWindowMemory
+from langchain_classic.memory import ConversationBufferWindowMemory
 from langchain_core.messages import HumanMessage
 import requests
-from langchain.agents import initialize_agent, Tool
-from langchain.agents.agent_types import AgentType
+from langchain_classic.agents import initialize_agent, Tool
+from langchain_classic.agents.agent_types import AgentType
 from datetime import datetime
 import wolframalpha
 from wakeonlan import send_magic_packet
@@ -26,6 +26,7 @@ from apscheduler.triggers.cron import CronTrigger
 import json
 import ssl
 import base64
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -270,14 +271,51 @@ async def send_mag_message(bot: telegram.Bot):
         logger.error(f"Error sending scheduled MAG message: {e}")
 
 
+@check_authorization
+async def get_cmp_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Get unique tickers from transactions table
+        transactions = portfolio_transactions_model.list()
+        tickers = set(tx.get('Ticker') for tx in transactions if tx.get('Ticker'))
+        print (transactions)
+        if not tickers:
+            logger.info("No tickers found in transactions table.")
+            return
+        
+        
+        # Fetch current market prices and update transactions
+        for ticker in tickers:
+            # try:
+                data = yf.Ticker(ticker)
+                cmp = data.info.get('currentPrice', 0)
+                
+                # Update all rows with this ticker
+                for tx in transactions:
+                    if tx.get('Ticker') == ticker:
+                        tx['CMP'] = cmp
+                        portfolio_transactions_model.update(tx['Id'],tx)
+                        
+                
+                logger.info(f"Updated CMP for ticker {ticker}: {cmp}")
+            # except Exception as e:
+            #     logger.error(f"Error fetching price for ticker {ticker}: {e}")
+        
+        await context.bot.send_message(chat_id=CHAT_ID, text="✅ CMP values updated for all tickers.", parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"Error in get_cmp_today: {e}")
+
+
 async def setup_scheduler(application):
-    scheduler.add_job(
-        send_mag_message,
-        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
-        args=[application.bot]
-    )
-    scheduler.start()
-    logger.info("🕒 Scheduler started for sending calendar at 8:00.")
+#     scheduler.add_job(
+#         send_mag_message,
+#         # get_cmp_today,
+# #        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
+#         #  CronTrigger(hour="*", minute="*", day="*", month="*", day_of_week="*"),
+#         args=[application.bot]
+#     )
+#     scheduler.start()
+#     logger.info("🕒 Scheduler started for sending calendar at 8:00.")
+    pass
 
 # Main runner
 if __name__ == '__main__':
@@ -290,7 +328,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
-
+    app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
     app.run_polling()
