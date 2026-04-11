@@ -1,671 +1,360 @@
 import os
-from hmac import new
-from re import sub
-from tabnanny import check
-import trace
-from litellm import transcription
-import openai
-from telegram import Update
+import sys
+
+# Ensure the project root is on sys.path so `bujo.*` imports work when this
+# script is run directly (VS Code / debugpy adds the script dir, not the root).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import base64
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from bujo.base import OPENAI_MODEL, TELEGRAM_TOKEN, expenses_model, mag_model, llm, check_authorization, WOLFRAM_APP_ID, PC_MAC_ADDRESS, BROADCAST_IP, scheduler, CHAT_ID, openai_model, TEXT_TO_SPEECH_MODEL, portfolio_transactions_model
+import json
+import logging
+import ssl
+from datetime import datetime
+
+import telegram
+import wolframalpha
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import Tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from apscheduler.triggers.cron import CronTrigger
+
+from bujo.base import (
+    OPENAI_MODEL,
+    TELEGRAM_TOKEN,
+    expenses_model,
+    mag_model,
+    llm,
+    check_authorization,
+    WOLFRAM_APP_ID,
+    PC_MAC_ADDRESS,
+    BROADCAST_IP,
+    scheduler,
+    CHAT_ID,
+    openai_model,
+    TEXT_TO_SPEECH_MODEL,
+    portfolio_transactions_model,
+)
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
-from langchain_classic.memory import ConversationBufferWindowMemory
-from langchain_core.messages import HumanMessage
-import requests
-from langchain_classic.agents import initialize_agent, Tool
-from langchain_classic.agents.agent_types import AgentType
-from datetime import datetime
-import wolframalpha
+from bujo.portoflio.manage import PortfolioManager
 from wakeonlan import send_magic_packet
-import logging
-import sys
-from typing import List, Dict
-import telegram
-from apscheduler.triggers.cron import CronTrigger
-import json
-import ssl
-import base64
-import yfinance as yf
+import requests
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = [
     "You are an expert personal assistant that helps me manage my finances and a calendar (which I call MAG).",
-
     "You have access to the following tools, and depending on my request, you will call the appropriate tool:",
-
     "1. Expenses Tool – If I talk about expenses, use this tool to add or list my expenses.",
     "2. MAG Tool – If I talk about MAG (my calendar/events), use this tool to add or list my MAG.",
-    "3. Wolfram Alpha Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
-    "4. Translation Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
-
+    "3. Wolfram_Alpha_Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
+    "4. Translation_Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
     "MOST IMPORTANT INSTRUCTIONS:",
     "Always call the appropriate tool based on my latest message. You must never answer directly without invoking a tool first.",
     "When sending a response (either to the LLM for summarization or to me), always return it as a string, not as a JSON object.",
     "Always return tool results in markdown format for readability.",
     "Separate individual items in the tool results with new lines.",
-    "Use emojis wherever appropriate to make the response more friendly and visually appealing. 🎯🧮📅💸📰🌐🔢📊🖼️🔤"
+    "Use emojis wherever appropriate to make the response more friendly and visually appealing. 🎯🧮📅💸📰🌐🔢📊🖼️🔤",
 ]
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-def prepend_system_prompt(user_input: str, sys_prompt: str) -> str:
-    return f"{sys_prompt}\n\nUser: {user_input}"
+_TG_MAX = 4096  # Telegram hard limit per message
 
-def build_chat_messages(user_input: str, sys_prompt: str) -> List[Dict[str, str]]:
-    return [
-        {'role': 'system', 'content':sys_prompt},
-        {'role':'human', 'content': user_input}
-    ]
 
-expense_manager = ExpenseManager(expenses_model, mag_model)
-mag_manager = MagManager(mag_model)
-memory = ConversationBufferWindowMemory(k=1, memory_key="chat_history", return_messages=True)
+async def _send_long(reply_func, text: str, **kwargs) -> None:
+    """Send text, splitting into multiple messages if it exceeds Telegram's 4096-char limit.
+
+    Splits preferentially on newlines so markdown blocks stay intact.
+    """
+    while text:
+        if len(text) <= _TG_MAX:
+            await reply_func(text, **kwargs)
+            return
+        split_at = text.rfind("\n", 0, _TG_MAX)
+        if split_at <= 0:
+            split_at = _TG_MAX
+        await reply_func(text[:split_at], **kwargs)
+        text = text[split_at:].lstrip("\n")
+
+
+expense_manager  = ExpenseManager(expenses_model, mag_model)
+mag_manager      = MagManager(mag_model)
+portfolio_manager = PortfolioManager(portfolio_transactions_model, mag_model)
 
 wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
-tools = [
-    Tool(
-        name="Expenses Interaction",
-        func=expense_manager.agent_expenses,
-        description="Use this tool to fetch expenses based on specific filters.",
-        return_direct=True,
+# Persistent memory for the outer agent; survives agent reconstruction each message.
+_main_memory = MemorySaver()
 
+# Static tools (no Telegram context needed)
+_static_tools = [
+    Tool(
+        name="Expenses_Interaction",
+        func=expense_manager.agent_expenses,
+        description="Use this tool to add or list expenses.",
+        return_direct=True,
     ),
     Tool(
-        name="MAG interaction",
+        name="MAG_interaction",
         func=mag_manager.agent_mag,
-        description="Use this tool to manage MAG.",
-        return_direct=True
+        description="Use this tool to manage MAG (calendar).",
+        return_direct=True,
     ),
     Tool(
-        name="Translation Tool",
-        func=lambda x: 'This tool must be awaited',
+        name="Translation_Tool",
+        func=lambda x: "This tool must be awaited",
         description="Use this tool to translate from one language to another.",
-        coroutine=lambda x: llm.ainvoke([HumanMessage(x)])
-    )
+        coroutine=lambda x: llm.ainvoke([HumanMessage(x)]),
+    ),
 ]
 
-# Tool function with runtime-bound user_id
-async def make_wolfram_alpha_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
-    async def query_tool(query: str):
-        logger.info(f"Queriying Wolfram Alpha for query: {query}")
+
+async def _make_wolfram_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
+    async def query_tool(query: str) -> str:
+        logger.info("Querying Wolfram Alpha for: %s", query)
         try:
             response = await wolfram_client.aquery(query)
-            if hasattr(response, 'pod'):
-                for pod in response['pod']:
-                    subpod = pod['subpod']
-                    if type(subpod) is list:
+            if hasattr(response, "pod"):
+                for pod in response["pod"]:
+                    subpod = pod["subpod"]
+                    if isinstance(subpod, list):
                         for item in subpod:
-                            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=item['img']['@src'], caption=item['@title'])
+                            await context.bot.send_photo(
+                                chat_id=update.effective_chat.id,
+                                photo=item["img"]["@src"],
+                                caption=item["@title"],
+                            )
                     else:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=subpod['img']['@src'], caption=pod['@title'])
+                        await context.bot.send_photo(
+                            chat_id=update.effective_chat.id,
+                            photo=subpod["img"]["@src"],
+                            caption=pod["@title"],
+                        )
             return "Response completed."
         except Exception as e:
-            logger.error(f"Error querying Wolfram Alpha: {e}")
+            logger.error("Error querying Wolfram Alpha: %s", e)
             return "Wolfram Alpha cannot handle this request, LLM should handle this if it can."
-    
+
     return Tool(
-        name="Wolfram Alpha Tool",
-        description="Wolfram Alpha Tool for complex or realtime queries.",
+        name="Wolfram_Alpha_Tool",
+        description="Wolfram_Alpha_Tool for complex or realtime queries.",
         func=query_tool,
-        coroutine=query_tool
+        coroutine=query_tool,
     )
 
-# Start command
+
 @check_authorization
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"/start command received from user: {update.effective_user.id}")
+    logger.info("/start from user %s", update.effective_user.id)
     await update.message.reply_text("Hi! I'm your Finances Bot 💳")
+
 
 @check_authorization
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    await agent_engage(update, context, text)
+    await agent_engage(update, context, update.message.text.strip())
 
-async def agent_engage(update, context, text):
-    # Initialize the tool here
-    tools_copy = tools.copy()
-    tools_copy.append(await make_wolfram_alpha_tool(update, context))
-    agent = initialize_agent(
-        tools=tools_copy, 
-        llm=llm, 
-        agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, 
-        memory=memory,
-        # handle_parsing_errors=True,
-        verbose=True
-    )
-    logger.info(f"Received chat message from user {update.effective_user.id}: {text}")
-    sys_prompt = SYSTEM_PROMPT.copy()
-    sys_prompt.append(f'Today\'s date is {datetime.now().strftime("%Y-%m-%d %A")}')
+
+async def agent_engage(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    tools = _static_tools + [await _make_wolfram_tool(update, context)]
+
+    def _state_modifier(state):
+        today = datetime.now().strftime("%Y-%m-%d %A")
+        content = "\n".join(SYSTEM_PROMPT) + f"\nToday's date is {today}."
+        return [SystemMessage(content=content)] + state["messages"]
+
+    agent = create_react_agent(llm, tools, prompt=_state_modifier, checkpointer=_main_memory)
+
+    logger.info("Chat from user %s: %s", update.effective_user.id, text)
     try:
         await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
-        response = await agent.ainvoke(prepend_system_prompt(text, sys_prompt))
-        logger.info(f"Agent response: {response}")
-        if 'output' in response and "HERE_IS_IMAGE" in response['output']:
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=text)]},
+            config={"configurable": {"thread_id": f"user_{update.effective_user.id}"}},
+        )
+        response_text = result["messages"][-1].content
+        logger.info("Agent response: %s", response_text)
+
+        if "HERE_IS_IMAGE" in response_text:
             try:
-                images_data = response['output'].split('\n')
+                images_data = response_text.split("\n")
                 for image in images_data[1:]:
-                    title, image_url = image.split('=>')
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url, caption=title)
-                logger.info(f"Sent images to user {update.effective_user.id}: {image_url}")
+                    title, image_url = image.split("=>")
+                    await context.bot.send_photo(
+                        chat_id=update.effective_chat.id, photo=image_url, caption=title
+                    )
             except Exception as e:
-                logger.error(f"Error generating image: {e}")
+                logger.error("Error sending image: %s", e)
                 await update.message.reply_text(f"Error generating image: {e}")
         else:
-            await update.message.reply_text(
-                response['output'],
-                parse_mode='markdown',
-            )
+            await _send_long(update.message.reply_text, response_text, parse_mode="markdown")
     except Exception as e:
-        logger.error(f"Error in chat handler: {e}")
+        logger.error("Error in chat handler: %s", e)
         await update.message.reply_text(f"An error occurred: {e}")
+
 
 @check_authorization
 async def voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice = update.message.voice.file_id
-    new_file = await context.bot.get_file(voice)
-    file_path = f"{voice}.ogg"
-
+    voice_msg = update.message.voice
+    new_file  = await context.bot.get_file(voice_msg.file_id)
+    file_path = f"{voice_msg.file_id}.ogg"
     await new_file.download_to_drive(file_path)
+    try:
+        with open(file_path, "rb") as audio_file:
+            transcript = openai_model.audio.transcriptions.create(
+                model=TEXT_TO_SPEECH_MODEL, file=audio_file
+            )
+        await agent_engage(update, context, transcript.text.strip())
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-    with open(file_path, "rb") as audio_file:
-        transcript = openai_model.audio.transcriptions.create(
-            model=TEXT_TO_SPEECH_MODEL,
-            file=audio_file,
-        )
-
-    text = transcript.text.strip()
-    await agent_engage(update, context, text)
 
 @check_authorization
 async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    image = update.message.photo[-1]
-    text = update.message.caption if update.message.caption else ""
-    file_info = await context.bot.get_file(image)
-    file_name = os.path.basename(file_info.file_path) if file_info.file_path else f"{image.file_id}.jpg"
-
+    photo     = update.message.photo[-1]
+    caption   = update.message.caption or ""
+    file_info = await context.bot.get_file(photo)
+    file_name = os.path.basename(file_info.file_path) if file_info.file_path else f"{photo.file_id}.jpg"
     await file_info.download_to_drive(file_name)
-
-    with open(file_name, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-
-    response = openai_model.responses.create(
-        model=OPENAI_MODEL,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "Summarize the image content in a single sentence.\nExcept if it is a transaction.\nIf it is a transaction, Provide response as below message.\nSpent <amount> on <item|whoever the money was sent to> on <date>.\nIf date is not present, assume today\'s date.\nIf amount is not present, assume it is zero.\nIf item is not present, assume it is miscellaneous."},
-                {"type": "input_text", "text": "The caption of the Image is: " + text +" so assume the caption is the <item> for this transaction"} if text else {"type": "input_text", "text": "No caption provided."},
-                {
-                    "type": "input_image",
-                    "image_url": f"data:image/jpeg;base64,{base64_image}",
-                },
-            ],
-        }]
-    )
-
-    await agent_engage(update, context, response.output_text)
+    try:
+        with open(file_name, "rb") as img_file:
+            b64 = base64.b64encode(img_file.read()).decode("utf-8")
+        caption_part = (
+            {"type": "input_text", "text": f"The caption of the Image is: {caption} so assume the caption is the <item> for this transaction"}
+            if caption
+            else {"type": "input_text", "text": "No caption provided."}
+        )
+        response = openai_model.responses.create(
+            model=OPENAI_MODEL,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": (
+                        "Summarize the image content in a single sentence.\n"
+                        "Except if it is a transaction.\n"
+                        "If it is a transaction, Provide response as below message.\n"
+                        "Spent <amount> on <item|whoever the money was sent to> on <date>.\n"
+                        "If date is not present, assume today's date.\n"
+                        "If amount is not present, assume it is zero.\n"
+                        "If item is not present, assume it is miscellaneous."
+                    )},
+                    caption_part,
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+                ],
+            }],
+        )
+        await agent_engage(update, context, response.output_text)
+    finally:
+        if os.path.exists(file_name):
+            os.remove(file_name)
 
 
 @check_authorization
 async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"wakeUpThePC command received from user: {update.effective_user.id}")
+    logger.info("wakeUpThePC from user %s", update.effective_user.id)
     try:
         send_magic_packet(PC_MAC_ADDRESS, ip_address=BROADCAST_IP)
         await update.message.reply_text("🔌 Magic packet sent to wake up the PC.")
-        logger.info("Magic packet sent successfully.")
     except requests.RequestException as e:
-        logger.error(f"Error sending magic packet: {e}")
+        logger.error("Error sending magic packet: %s", e)
         await update.message.reply_text(f"Waking up the PC: {e}")
-        
+
 
 @check_authorization
 async def genPass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"GenPass triggered from user: {update.effective_user.id}")
+    logger.info("GenPass from user %s", update.effective_user.id)
     try:
-        translation = str.maketrans('/=+-','abcd')
-        num_chars = int(context.args[0]) if context.args else 13
-        password = ""
-        for iter in range(num_chars//4):
+        translation = str.maketrans("/=+-", "abcd")
+        num_chars   = int(context.args[0]) if context.args else 13
+        password    = ""
+        for _ in range(num_chars // 4):
             password += f"{base64.b64encode(ssl.RAND_bytes(13)).decode('utf-8')[:4].translate(translation)}-"
-        
-        password = password.strip('-')[:num_chars]
+        password = password.strip("-")[:num_chars]
         await update.message.reply_text("🔑 Password Generated:")
         await update.message.reply_text(password)
-        logger.info("Secure password generated.")
-    except requests.RequestException as e:
-        logger.error(f"Unable to Generate password: {e}")
+    except Exception as e:
+        logger.error("Unable to generate password: %s", e)
         await update.message.reply_text(f"Failed to generate password: {e}")
 
+
 async def send_mag_message(bot: telegram.Bot):
-    """
-    Function to send a message to the MAG channel.
-    This can be scheduled to run periodically.
-    """
     try:
-        mag_info_list = mag_manager.mag_model.list(json.dumps({"filters": [f"(Date,eq,exactDate,{datetime.now().strftime('%Y-%m-%d')})"]}))
-        if len(mag_info_list) == 0:
-            response = "No MAG entries found for today."
+        mag_info_list = mag_manager.mag_model.list(
+            json.dumps({"filters": [f"(Date,eq,exactDate,{datetime.now().strftime('%Y-%m-%d')})"]}))
+        if not mag_info_list:
             return
-        else:
-            mag_info = mag_info_list[0]
-            response = "Todays's MAG:\n" + \
-                f"**📅 Date:** {mag_info['Date']}\n" + \
-                f"**🌖 Tithi:** {mag_info['Tithi']}\n" 
-            
-            if mag_info['Note']:
-                response += f"**📝 Note:** {mag_info['Note']}\n"
-        # Replace with actual logic to fetch or generate the message
-        await bot.send_message(chat_id=CHAT_ID, text=response, parse_mode='markdown')
-        logger.info("Scheduled MAG message sent successfully.")
+        mag_info = mag_info_list[0]
+        response = (
+            "Todays's MAG:\n"
+            f"**📅 Date:** {mag_info['Date']}\n"
+            f"**🌖 Tithi:** {mag_info['Tithi']}\n"
+        )
+        if mag_info.get("Note"):
+            response += f"**📝 Note:** {mag_info['Note']}\n"
+        await bot.send_message(chat_id=CHAT_ID, text=response, parse_mode="markdown")
+        logger.info("Scheduled MAG message sent.")
     except Exception as e:
-        logger.error(f"Error sending scheduled MAG message: {e}")
+        logger.error("Error sending scheduled MAG message: %s", e)
 
 
 @check_authorization
 async def get_cmp_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Get unique tickers from transactions table
-        transactions = portfolio_transactions_model.list()
-        tickers = set(tx.get('Ticker') for tx in transactions if tx.get('Ticker'))
-        print (transactions)
-        if not tickers:
-            logger.info("No tickers found in transactions table.")
-            return
-        
-        
-        # Fetch current market prices and update transactions
-        for ticker in tickers:
-            # try:
-                data = yf.Ticker(ticker)
-                cmp = data.info.get('currentPrice', 0)
-                
-                # Update all rows with this ticker
-                for tx in transactions:
-                    if tx.get('Ticker') == ticker:
-                        tx['CMP'] = cmp
-                        portfolio_transactions_model.update(tx)
-                        
-                
-                logger.info(f"Updated CMP for ticker {ticker}: {cmp}")
-            # except Exception as e:
-            #     logger.error(f"Error fetching price for ticker {ticker}: {e}")
-        
-        await context.bot.send_message(chat_id=CHAT_ID, text="✅ CMP values updated for all tickers.", parse_mode='markdown')
+        msg = portfolio_manager.update_cmp()
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="markdown")
     except Exception as e:
-        logger.error(f"Error in get_cmp_today: {e}")
+        logger.error("Error in get_cmp_today: %s", e)
+
 
 @check_authorization
 async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
-
-        # ── 1. Fetch all transactions ────────────────────────────────────────────
-        transactions = portfolio_transactions_model.list()
-        if not transactions:
-            await update.message.reply_text("📭 No portfolio transactions found.")
-            return
-
-        # ── 2. Fetch USD → INR conversion rate via yfinance ──────────────────────
-        usd_inr_ticker = yf.Ticker("USDINR=X")
-        usd_to_inr = usd_inr_ticker.info.get("regularMarketPrice") or usd_inr_ticker.fast_info.get("lastPrice", 84.0)
-        logger.info(f"USD → INR rate: {usd_to_inr}")
-
-        # ── 3. Aggregate per ticker ──────────────────────────────────────────────
-        # ticker_data[ticker] = {
-        #   "portfolio": str,        # Portfolio name
-        #   "currency": "INR" | "USD",
-        #   "total_bought": float,   # total shares bought
-        #   "total_sold": float,     # total shares sold
-        #   "buy_cost_inr": float,   # weighted cost basis in INR
-        #   "sell_proceeds_inr": float,
-        #   "cmp_inr": float,        # latest CMP in INR
-        # }
-        ticker_data: Dict[str, Dict] = {}
-
-        for tx in transactions:
-            ticker    = tx.get("Ticker", "").strip()
-            tx_type   = tx.get("TransactionType", "").strip()   # "Buy" or "Sell"
-            shares    = float(tx.get("NoOfShares") or 0)
-            cost      = float(tx.get("CostPerShare") or 0)
-            cmp       = float(tx.get("CMP") or 0)
-            portfolio = tx.get("Portfolio", "Unknown").strip()
-
-            if not ticker or shares == 0:
-                continue
-
-            is_inr    = ticker.upper().endswith(".NS")
-            currency  = "INR" if is_inr else "USD"
-            fx        = 1.0 if is_inr else usd_to_inr
-
-            if ticker not in ticker_data:
-                ticker_data[ticker] = {
-                    "portfolio": portfolio,
-                    "currency": currency,
-                    "total_bought": 0.0,
-                    "total_sold": 0.0,
-                    "buy_cost_inr": 0.0,
-                    "sell_proceeds_inr": 0.0,
-                    "cmp_inr": cmp * fx,
-                }
-
-            # Always keep the latest CMP (last row wins – same as get_cmp_today logic)
-            if cmp:
-                ticker_data[ticker]["cmp_inr"] = cmp * fx
-
-            if tx_type == "Buy":
-                ticker_data[ticker]["total_bought"]  += shares
-                ticker_data[ticker]["buy_cost_inr"]  += shares * cost * fx
-            elif tx_type == "Sell":
-                ticker_data[ticker]["total_sold"]     += shares
-                ticker_data[ticker]["sell_proceeds_inr"] += shares * cost * fx
-
-        # ── 4. Classify tickers & compute P&L ───────────────────────────────────
-        open_tickers:   List[Dict] = []
-        closed_tickers: List[Dict] = []
-
-        for ticker, d in ticker_data.items():
-            net_shares   = d["total_bought"] - d["total_sold"]
-            avg_cost_inr = (d["buy_cost_inr"] / d["total_bought"]) if d["total_bought"] else 0.0
-            cmp_inr      = d["cmp_inr"]
-
-            if net_shares > 0:
-                # ── OPEN position ────────────────────────────────────────────────
-                current_value_inr  = net_shares * cmp_inr
-                invested_value_inr = net_shares * avg_cost_inr
-                unrealised_pl      = current_value_inr - invested_value_inr
-                unrealised_pct     = (unrealised_pl / invested_value_inr * 100) if invested_value_inr else 0.0
-
-                # Realised P&L from partial sells (if any)
-                realised_pl = d["sell_proceeds_inr"] - (d["total_sold"] * avg_cost_inr)
-
-                open_tickers.append({
-                    "ticker":           ticker,
-                    "currency":         d["currency"],
-                    "net_shares":       net_shares,
-                    "avg_cost_inr":     avg_cost_inr,
-                    "cmp_inr":          cmp_inr,
-                    "invested_inr":     invested_value_inr,
-                    "current_inr":      current_value_inr,
-                    "unrealised_pl":    unrealised_pl,
-                    "unrealised_pct":   unrealised_pct,
-                    "realised_pl":      realised_pl,
-                })
-            else:
-                # ── CLOSED position (fully sold) ─────────────────────────────────
-                realised_pl  = d["sell_proceeds_inr"] - d["buy_cost_inr"]
-                realised_pct = (realised_pl / d["buy_cost_inr"] * 100) if d["buy_cost_inr"] else 0.0
-
-                closed_tickers.append({
-                    "ticker":        ticker,
-                    "currency":      d["currency"],
-                    "buy_cost_inr":  d["buy_cost_inr"],
-                    "sell_inr":      d["sell_proceeds_inr"],
-                    "realised_pl":   realised_pl,
-                    "realised_pct":  realised_pct,
-                })
-
-        # ── 5. Build the Telegram message ────────────────────────────────────────
-        def fmt_inr(val: float) -> str:
-            """Format a rupee value with ₹ sign and comma separators."""
-            return f"₹{val:,.2f}"
-
-        def fmt_usd(val: float) -> str:
-            """Format a dollar value with $ sign and comma separators."""
-            return f"${val:,.2f}"
-
-        def pl_emoji(val: float) -> str:
-            return "🟢" if val >= 0 else "🔴"
-
-        def build_section(
-            section_open: List[Dict],
-            section_closed: List[Dict],
-            is_usd: bool,
-        ) -> List[str]:
-            """Build lines for one currency bucket (INR or USD)."""
-            fmt      = fmt_usd if is_usd else fmt_inr
-            # For USD tickers the stored values are already in INR (multiplied by fx),
-            # but we want to display them in USD for clarity.
-            fx_div   = usd_to_inr if is_usd else 1.0
-            sec_lines: List[str] = []
-
-            # ── Open ─────────────────────────────────────────────────────────────
-            if section_open:
-                inv_total  = sum(t["invested_inr"] for t in section_open)
-                cur_total  = sum(t["current_inr"]  for t in section_open)
-                unreal_tot = cur_total - inv_total
-                real_open  = sum(t["realised_pl"]  for t in section_open)
-
-                sec_lines.append(f"📂 *Open* ({len(section_open)})")
-                sec_lines.append("─────────────────────────────")
-
-                for t in sorted(section_open, key=lambda x: x["unrealised_pl"], reverse=True):
-                    emoji = pl_emoji(t["unrealised_pl"])
-                    avg   = t["avg_cost_inr"]  / fx_div
-                    cmp   = t["cmp_inr"]       / fx_div
-                    inv   = t["invested_inr"]  / fx_div
-                    cur   = t["current_inr"]   / fx_div
-                    upl   = t["unrealised_pl"] / fx_div
-                    rpl   = t["realised_pl"]   / fx_div
-                    sec_lines.append(
-                        f"{emoji} *{t['ticker']}*\n"
-                        f"   Shares: `{t['net_shares']:.4f}` | Avg Cost: {fmt(avg)}\n"
-                        f"   CMP: {fmt(cmp)} | Invested: {fmt(inv)}\n"
-                        f"   Current: {fmt(cur)} | "
-                        f"Unrealised: {fmt(upl)} ({t['unrealised_pct']:+.2f}%)"
-                        + (f"\n   Realised (partial): {fmt(rpl)}" if t["realised_pl"] != 0 else "")
-                    )
-
-                sec_lines.append("─────────────────────────────")
-                sec_lines.append(
-                    f"📌 *Open Totals*\n"
-                    f"   Invested: {fmt(inv_total / fx_div)}\n"
-                    f"   Current:  {fmt(cur_total / fx_div)}\n"
-                    f"   {pl_emoji(unreal_tot)} Unrealised P&L: {fmt(unreal_tot / fx_div)} "
-                    f"({(unreal_tot / inv_total * 100) if inv_total else 0:+.2f}%)"
-                    + (f"\n   Realised (partial sells): {fmt(real_open / fx_div)}" if real_open else "")
-                )
-            else:
-                sec_lines.append("📂 *Open Positions:* None")
-
-            # ── Closed ───────────────────────────────────────────────────────────
-            if section_closed:
-                buy_tot  = sum(t["buy_cost_inr"] for t in section_closed)
-                sell_tot = sum(t["sell_inr"]      for t in section_closed)
-                real_tot = sell_tot - buy_tot
-
-                sec_lines.append("")
-                sec_lines.append(f"✅ *Closed* ({len(section_closed)})")
-                sec_lines.append("─────────────────────────────")
-
-                for t in sorted(section_closed, key=lambda x: x["realised_pl"], reverse=True):
-                    emoji = pl_emoji(t["realised_pl"])
-                    sec_lines.append(
-                        f"{emoji} *{t['ticker']}*\n"
-                        f"   Invested: {fmt(t['buy_cost_inr'] / fx_div)} | Sold: {fmt(t['sell_inr'] / fx_div)}\n"
-                        f"   Realised P&L: {fmt(t['realised_pl'] / fx_div)} ({t['realised_pct']:+.2f}%)"
-                    )
-
-                sec_lines.append("─────────────────────────────")
-                sec_lines.append(
-                    f"📌 *Closed Totals*\n"
-                    f"   Total Invested: {fmt(buy_tot / fx_div)}\n"
-                    f"   Total Sold:     {fmt(sell_tot / fx_div)}\n"
-                    f"   {pl_emoji(real_tot)} Realised P&L: {fmt(real_tot / fx_div)} "
-                    f"({(real_tot / buy_tot * 100) if buy_tot else 0:+.2f}%)"
-                )
-            else:
-                sec_lines.append("\n✅ *Closed Positions:* None")
-
-            return sec_lines
-
-        # ── Split by portfolio ────────────────────────────────────────────────────
-        # Create a dict mapping portfolio name to {open, closed} tickers
-        portfolios: Dict[str, Dict[str, List]] = {}
-        
-        for ticker, d in ticker_data.items():
-            portfolio = d["portfolio"]
-            if portfolio not in portfolios:
-                portfolios[portfolio] = {"open": [], "closed": []}
-            
-            # Determine if this ticker is open or closed
-            net_shares = d["total_bought"] - d["total_sold"]
-            if net_shares > 0:
-                portfolios[portfolio]["open"].append(ticker)
-            else:
-                portfolios[portfolio]["closed"].append(ticker)
-
-        lines: List[str] = []
-
-        # ── Header ───────────────────────────────────────────────────────────────
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("📊 *Portfolio P&L Summary*")
-        lines.append(f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
-        lines.append(f"💱 USD → INR: ₹{usd_to_inr:.2f}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-        # ── Process each portfolio ────────────────────────────────────────────────
-        grand_invested = 0.0
-        grand_current = 0.0
-        
-        for portfolio_name in sorted(portfolios.keys()):
-            portfolio_data = portfolios[portfolio_name]
-            portfolio_open_tickers = [open_tickers[i] for i, t in enumerate(open_tickers) if t["ticker"] in portfolio_data["open"]]
-            portfolio_closed_tickers = [closed_tickers[i] for i, t in enumerate(closed_tickers) if t["ticker"] in portfolio_data["closed"]]
-            
-            lines.append("")
-            lines.append(f"💼 *{portfolio_name}*")
-            
-            # Determine if portfolio has both INR and USD or just one
-            has_inr = any(t["currency"] == "INR" for t in portfolio_open_tickers + portfolio_closed_tickers)
-            has_usd = any(t["currency"] == "USD" for t in portfolio_open_tickers + portfolio_closed_tickers)
-            
-            port_invested = 0.0
-            port_current = 0.0
-            
-            # Build sections for INR tickers in this portfolio
-            if has_inr:
-                inr_open = [t for t in portfolio_open_tickers if t["currency"] == "INR"]
-                inr_closed = [t for t in portfolio_closed_tickers if t["currency"] == "INR"]
-                if inr_open or inr_closed:
-                    lines.append("🇮🇳 *Indian Stocks (INR)*")
-                    lines.extend(build_section(inr_open, inr_closed, is_usd=False))
-                    
-                    inr_invested = sum(t["invested_inr"] for t in inr_open) + sum(t["buy_cost_inr"] for t in inr_closed)
-                    inr_current = sum(t["current_inr"] for t in inr_open) + sum(t["sell_inr"] for t in inr_closed)
-                    inr_pl = inr_current - inr_invested
-                    port_invested += inr_invested
-                    port_current += inr_current
-                    grand_invested += inr_invested
-                    grand_current += inr_current
-                    
-                    lines.append(f"   🏦 INR Subtotal: {fmt_inr(inr_invested)} → {fmt_inr(inr_current)}  {pl_emoji(inr_pl)} {fmt_inr(inr_pl)}")
-            
-            # Build sections for USD tickers in this portfolio
-            if has_usd:
-                usd_open = [t for t in portfolio_open_tickers if t["currency"] == "USD"]
-                usd_closed = [t for t in portfolio_closed_tickers if t["currency"] == "USD"]
-                if usd_open or usd_closed:
-                    lines.append("🇺🇸 *US Stocks (USD)*")
-                    lines.extend(build_section(usd_open, usd_closed, is_usd=True))
-                    
-                    usd_invested_inr = sum(t["invested_inr"] for t in usd_open) + sum(t["buy_cost_inr"] for t in usd_closed)
-                    usd_current_inr = sum(t["current_inr"] for t in usd_open) + sum(t["sell_inr"] for t in usd_closed)
-                    usd_pl_inr = usd_current_inr - usd_invested_inr
-                    port_invested += usd_invested_inr
-                    port_current += usd_current_inr
-                    grand_invested += usd_invested_inr
-                    grand_current += usd_current_inr
-                    
-                    lines.append(f"   🏦 USD Subtotal: {fmt_usd(usd_invested_inr / usd_to_inr)} → {fmt_usd(usd_current_inr / usd_to_inr)}  {pl_emoji(usd_pl_inr)} {fmt_usd(usd_pl_inr / usd_to_inr)}")
-            
-            # Portfolio total
-            port_pl = port_current - port_invested
-            
-            lines.append("─────────────────────────────")
-            lines.append(
-                f"📌 *{portfolio_name} Total*: {fmt_inr(port_invested)} → {fmt_inr(port_current)}  "
-                f"{pl_emoji(port_pl)} {fmt_inr(port_pl)} "
-                f"({(port_pl / port_invested * 100) if port_invested else 0:+.2f}%)"
-            )
-
-        # ── Grand Total (everything in INR) ──────────────────────────────────────
-        grand_pl = grand_current - grand_invested
-
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(
-            f"💼 *Grand Total (INR equivalent)*\n"
-            f"   Total Invested: {fmt_inr(grand_invested)}\n"
-            f"   Total Value:    {fmt_inr(grand_current)}\n"
-            f"   {pl_emoji(grand_pl)} Overall P&L: {fmt_inr(grand_pl)} "
-            f"({(grand_pl / grand_invested * 100) if grand_invested else 0:+.2f}%)"
-        )
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-        message = "\n".join(lines)
-
-        await update.message.reply_text(message, parse_mode="Markdown")
-        logger.info("P&L summary sent successfully.")
-
+        message = portfolio_manager.get_profit_loss_report()
+        await _send_long(update.message.reply_text, message, parse_mode="Markdown")
+        logger.info("P&L summary sent.")
     except Exception as e:
-        logger.error(f"Error in get_profit_loss: {e}", exc_info=True)
+        logger.error("Error in get_profit_loss: %s", e, exc_info=True)
         await update.message.reply_text(f"❌ Error generating P&L report: {e}")
 
 
 async def setup_scheduler(application):
-    # Wrapper for get_cmp_today to work with scheduler
-    async def scheduled_get_cmp_today():
+    async def scheduled_update_cmp():
         try:
-            # Get unique tickers from transactions table
-            transactions = portfolio_transactions_model.list()
-            tickers = set(tx.get('Ticker') for tx in transactions if tx.get('Ticker'))
-            
-            if not tickers:
-                logger.info("No tickers found in transactions table.")
-                return
-            
-            # Fetch current market prices and update transactions
-            for ticker in tickers:
-                data = yf.Ticker(ticker)
-                cmp = data.info.get('currentPrice', 0)
-                
-                # Update all rows with this ticker
-                for tx in transactions:
-                    if tx.get('Ticker') == ticker:
-                        tx['CMP'] = cmp
-                        portfolio_transactions_model.update(tx)
-                
-                logger.info(f"Updated CMP for ticker {ticker}: {cmp}")
-            
-            await application.bot.send_message(chat_id=CHAT_ID, text="✅ CMP values updated for all tickers.", parse_mode='markdown')
+            msg = portfolio_manager.update_cmp()
+            await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="markdown")
         except Exception as e:
-            logger.error(f"Error in scheduled get_cmp_today: {e}")
-    
+            logger.error("Error in scheduled CMP update: %s", e)
+
     scheduler.add_job(
         send_mag_message,
-        CronTrigger(hour="8", minute="0", day="*", month="*", day_of_week="*"),
-        args=[application.bot]
+        CronTrigger(hour="8", minute="0"),
+        args=[application.bot],
     )
     scheduler.add_job(
-        scheduled_get_cmp_today,
-        CronTrigger(hour="8", minute="15", day="*", month="*", day_of_week="0-4"),
+        scheduled_update_cmp,
+        CronTrigger(hour="8", minute="15", day_of_week="0-4"),
     )
     scheduler.start()
-    logger.info("🕒 Scheduler started for sending calendar at 8:00 and updating CMP at 8:15 (Mon-Fri).")
+    logger.info("🕒 Scheduler started.")
 
-# Main runner
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     logger.info("Starting the Telegram bot application.")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(setup_scheduler).build()
 
@@ -677,6 +366,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
+
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
     app.run_polling()

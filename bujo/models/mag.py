@@ -1,93 +1,49 @@
-import requests
-from typing import Optional, List, Dict, Any
 import json
+import logging
+import requests
+from typing import Any, Dict, List, Optional
 
-from bujo import mag
+from bujo.models.base import BaseNocoDB
+
+logger = logging.getLogger(__name__)
+
+# Fields the LLM is allowed to modify via Update MAG.
+_UPDATABLE_FIELDS = {"Note", "Exercise"}
 
 
-class MAG:
+class MAG(BaseNocoDB):
     def __init__(self, base_url: str, api_token: str, mag_table_id: str):
-        """
-        Initializes the instance with the provided base URL, API token, and table ID.
-        Args:
-            base_url (str): The base URL for the API endpoint. Trailing slashes will be removed.
-            api_token (str): The API token used for authentication.
-            mag_table_id (str): The ID of the table to interact with.
-        Attributes:
-            base_url (str): The sanitized base URL without trailing slashes.
-            table_id (str): The ID of the table to interact with, initialized as an empty string.
-            headers (dict): A dictionary containing the headers for API requests, including the
-                            API token, content type, and accepted response format.
-        """
+        super().__init__(base_url, api_token, mag_table_id)
 
-        self.base_url = base_url.rstrip("/")
-        self.table_id = mag_table_id
-        self.headers = {
-            "xc-token": api_token,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-
-    def _url(self, path="") -> str:
-        return f"{self.base_url}/api/v2/tables/{self.table_id}/records{path}"
-
-    def create(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        response = requests.post(self._url(), json=data, headers=self.headers)
-        if response.ok:
-            return response.json()
-        print("❌ Create failed:", response.status_code, response.text)
-        return None
-
-    def read(self, record_id: str) -> Optional[Dict[str, Any]]:
-        url = self._url(f"/{record_id}")
-        response = requests.get(url, headers=self.headers)
-        if response.ok:
-            return response.json()
-        print("❌ Read failed:", response.status_code, response.text)
-        return None
-
-    def update(self, data: str) -> Optional[Dict[str, Any]]:
-        data = json.loads(data.replace('```json', '').replace('```', ''))
-        mag_object = self.find_by_date(data['date_filter'])
+    def update(self, data: str) -> str:
+        parsed = json.loads(data.replace("```json", "").replace("```", ""))
+        mag_object = self.find_by_date(parsed["date_filter"])
         if not mag_object:
             return "Failed to find MAG object with the given date filter."
-        allowed_keys = {"Id", "Date", "Note", "Tithi", "Exercise"}
-        mag_object.update(data['payload'])
-        filtered_data = {key: value for key, value in mag_object.items() if key in allowed_keys}
-        response = requests.patch(self._url(), json=filtered_data, headers=self.headers)
+        mag_object.update({k: v for k, v in parsed["payload"].items() if k in _UPDATABLE_FIELDS})
+        payload = {"Id": mag_object["Id"]}
+        payload.update({k: mag_object[k] for k in _UPDATABLE_FIELDS if k in mag_object})
+        response = requests.patch(self._url(), json=payload, headers=self.headers)
         if response.ok:
             return response.text
-        print("❌ Update failed:", response.status_code, response.text)
-        return 'Updating MAG failed. Try again?'
+        logger.error("Update failed: %s %s", response.status_code, response.text)
+        return "Updating MAG failed. Try again?"
 
-    def delete(self, record_id: str) -> bool:
-        response = requests.delete(self._url(f"/{record_id}"), headers=self.headers)
-        if response.ok:
-            return True
-        print("❌ Delete failed:", response.status_code, response.text)
-        return False
-
-    def list(self, where: Optional[str] = None, limit: int = 25,  sort: Optional[str] = None) -> List[Dict[str, Any]]:
-        where = json.loads(where.replace('```json', '').replace('```', ''))['filters'] if where else None
-        params = {"limit": limit}
-        if where:
-            params["where"] = where
+    def list(self, where: Optional[str] = None, sort: Optional[str] = None) -> List[Dict[str, Any]]:
+        parsed = json.loads(where.replace("```json", "").replace("```", "")) if where else {}
+        filters = parsed.get("filters")
+        params: Dict[str, Any] = {}
+        if filters:
+            params["where"] = filters
         if sort:
             params["sort"] = sort
-        response = requests.get(self._url(), headers=self.headers, params=params)
-        if response.ok:
-            return response.json().get("list", [])
-        print("❌ List failed:", response.status_code, response.text)
-        return []
+        return self._paginated_list(params)
 
     def find_by_date(self, iso_date_str: str) -> Optional[Dict[str, Any]]:
-        """
-        Search MAG record by ISO-formatted date string (e.g., "2025-04-10")
-        """
         params = {"where": f"(Date,eq,exactDate,{iso_date_str})"}
         response = requests.get(self._url(), headers=self.headers, params=params)
         if response.ok:
             items = response.json().get("list", [])
             return items[0] if items else None
-        print("❌ Search by date failed:", response.status_code, response.text)
+        logger.error("Search by date failed: %s %s", response.status_code, response.text)
         return None

@@ -60,6 +60,20 @@ def patched_create_chat_result(self, response, generation_info):
 
 ChatOpenAI._create_chat_result = patched_create_chat_result
 
+# gpt-5-mini does not support the 'stop' parameter.
+# LangChain's ReAct agent always injects stop sequences, so strip them here.
+_orig_generate = ChatOpenAI._generate
+_orig_agenerate = ChatOpenAI._agenerate
+
+def _patched_generate(self, messages, stop=None, run_manager=None, **kwargs):
+    return _orig_generate(self, messages, stop=None, run_manager=run_manager, **kwargs)
+
+async def _patched_agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+    return await _orig_agenerate(self, messages, stop=None, run_manager=run_manager, **kwargs)
+
+ChatOpenAI._generate = _patched_generate
+ChatOpenAI._agenerate = _patched_agenerate
+
 llm = ChatOpenAI(model=OPENAI_MODEL)
 openai_model = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 mag_model = MAG(NOCODB_BASE_URL, NOCODB_API_TOKEN, NOCODB_MAG_TABLE_ID)
