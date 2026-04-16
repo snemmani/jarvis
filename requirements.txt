@@ -11,4 +11,5 @@ langchain-xai
 apscheduler
 litellm
 yfinance
+matplotlib
 debugpy

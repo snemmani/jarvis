@@ -46,6 +46,7 @@ from bujo.base import (
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from bujo.portoflio.manage import PortfolioManager
+from bujo.analytics.charts import spending_pie_chart, spending_bar_chart
 from wakeonlan import send_magic_packet
 import requests
 
@@ -58,6 +59,7 @@ SYSTEM_PROMPT = [
     "2. MAG Tool – If I talk about MAG (my calendar/events), use this tool to add or list my MAG.",
     "3. Wolfram_Alpha_Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
     "4. Translation_Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
+    "5. Expense_Analytics_Tool – If I ask for expense charts, spending breakdown, category analysis, daily trend, or any analytics/visualisation, use this tool. Pass a JSON string with 'start_date' (YYYY-MM-DD), 'end_date' (YYYY-MM-DD, exclusive upper bound), and 'chart_type' ('pie' for category breakdown, 'bar' for daily trend). Example: {\"start_date\": \"2025-04-01\", \"end_date\": \"2025-05-01\", \"chart_type\": \"pie\"}.",
     "MOST IMPORTANT INSTRUCTIONS:",
     "Always call the appropriate tool based on my latest message. You must never answer directly without invoking a tool first.",
     "When sending a response (either to the LLM for summarization or to me), always return it as a string, not as a JSON object.",
@@ -158,6 +160,69 @@ async def _make_wolfram_tool(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def _make_analytics_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
+    async def analytics_tool(query: str) -> str:
+        import json as _json
+        logger.info("Expense analytics request: %s", query)
+        try:
+            params = _json.loads(query.replace("```json", "").replace("```", "").strip())
+        except Exception:
+            return "Invalid input. Expected JSON with start_date, end_date, and chart_type (pie or bar)."
+
+        start = params.get("start_date")
+        end = params.get("end_date")
+        chart_type = str(params.get("chart_type", "pie")).lower()
+
+        filters = []
+        if start:
+            filters.append(f"(Date,ge,exactDate,{start})")
+        if end:
+            filters.append(f"(Date,lt,exactDate,{end})")
+
+        expenses = expenses_model.list(
+            json.dumps({"filters": filters}) if filters else None
+        )
+        if not expenses:
+            return "No expenses found for that period — nothing to chart."
+
+        grand_total = sum(float(e.get("Amount") or 0) for e in expenses)
+        period_label = f"{start} to {end}" if start and end else "All Time"
+
+        try:
+            if chart_type == "bar":
+                buf = spending_bar_chart(expenses, f"Daily Spending — {period_label}")
+                caption = f"📊 *Daily spending trend*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
+            else:
+                buf = spending_pie_chart(expenses, f"Spending Breakdown — {period_label}")
+                caption = f"🥧 *Category breakdown*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
+
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=buf,
+                caption=caption,
+                parse_mode="markdown",
+            )
+            return (
+                f"Chart sent. {len(expenses)} transactions totalling ₹{grand_total:,.0f} "
+                f"for the period {period_label}."
+            )
+        except Exception as e:
+            logger.error("Chart generation failed: %s", e, exc_info=True)
+            return f"Failed to generate chart: {e}"
+
+    return Tool(
+        name="Expense_Analytics_Tool",
+        description=(
+            "Generate visual expense charts (pie or bar). Use when the user asks for charts, "
+            "spending breakdown, category analysis, or daily trends. "
+            "Input: JSON string with 'start_date' (YYYY-MM-DD), 'end_date' (YYYY-MM-DD, exclusive), "
+            "and 'chart_type' ('pie' or 'bar')."
+        ),
+        func=analytics_tool,
+        coroutine=analytics_tool,
+    )
+
+
 @check_authorization
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("/start from user %s", update.effective_user.id)
@@ -170,7 +235,10 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def agent_engage(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    tools = _static_tools + [await _make_wolfram_tool(update, context)]
+    tools = _static_tools + [
+        await _make_wolfram_tool(update, context),
+        await _make_analytics_tool(update, context),
+    ]
 
     def _state_modifier(state):
         today = datetime.now().strftime("%Y-%m-%d %A")
