@@ -107,9 +107,8 @@ class PortfolioManager:
     def get_profit_loss_report(self) -> str:
         """Compute P&L across all portfolio positions and return a formatted Markdown string.
 
-        All CostPerShare values in the DB are stored in ₹.
-        CMP from yfinance is in the stock's native currency (₹ for .NS, USD for others),
-        so only CMP needs a USD→INR conversion for US-listed stocks.
+        CostPerShare and CMP from yfinance are both in the stock's native currency
+        (₹ for .NS, USD for US stocks), so both need USD→INR conversion for US-listed stocks.
         """
         transactions = self.transactions_model.list()
         if not transactions:
@@ -134,27 +133,25 @@ class PortfolioManager:
             if not ticker or shares == 0:
                 continue
 
-            is_inr  = ticker.upper().endswith(".NS")
+            is_inr   = ticker.upper().endswith(".NS")
             currency = "INR" if is_inr else "USD"
-            # CostPerShare is always stored in ₹ — no fx needed for cost.
-            # CMP from yfinance is USD for US stocks, so convert that to ₹.
-            cmp_fx  = 1.0 if is_inr else usd_to_inr
+            fx       = 1.0 if is_inr else usd_to_inr  # applies to both CMP and CostPerShare
 
             if ticker not in ticker_data:
                 ticker_data[ticker] = {
                     "portfolio": portfolio, "currency": currency,
                     "total_bought": 0.0, "total_sold": 0.0,
                     "buy_cost_inr": 0.0, "sell_proceeds_inr": 0.0,
-                    "cmp_inr": cmp * cmp_fx,
+                    "cmp_inr": cmp * fx,
                 }
             if cmp:
-                ticker_data[ticker]["cmp_inr"] = cmp * cmp_fx
+                ticker_data[ticker]["cmp_inr"] = cmp * fx
             if tx_type == "Buy":
                 ticker_data[ticker]["total_bought"]       += shares
-                ticker_data[ticker]["buy_cost_inr"]       += shares * cost   # cost already ₹
+                ticker_data[ticker]["buy_cost_inr"]       += shares * cost * fx
             elif tx_type == "Sell":
                 ticker_data[ticker]["total_sold"]          += shares
-                ticker_data[ticker]["sell_proceeds_inr"]   += shares * cost  # cost already ₹
+                ticker_data[ticker]["sell_proceeds_inr"]   += shares * cost * fx
 
         open_tickers:   List[Dict] = []
         closed_tickers: List[Dict] = []
