@@ -345,29 +345,32 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_authorization
 async def updateDDNS(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     logger.info("updateDDNS from user %s", update.effective_user.id)
+
+    def _do_update() -> tuple[str, str]:
+        ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
+        resp = requests.get(
+            "https://dynupdate.no-ip.com/nic/update",
+            params={"hostname": NOIP_HOSTNAME, "myip": ip},
+            auth=(NOIP_USERNAME, NOIP_PASSWORD),
+            headers={"User-Agent": "JARVISBot/1.0 " + NOIP_USERNAME},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return ip, resp.text.strip()
+
     try:
         import asyncio
-        proc = await asyncio.create_subprocess_exec(
-            "noip-duc",
-            "--username", NOIP_USERNAME,
-            "--password", NOIP_PASSWORD,
-            "-g", NOIP_HOSTNAME,
-            "--ip-method", "http://ip1.dynupdate6.no-ip.com/",
-            "--once",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        output = stdout.decode().strip() or "(no output)"
-        if proc.returncode == 0:
-            await update.message.reply_text(f"✅ DDNS updated.\n`{output}`", parse_mode="markdown")
+        current_ip, status = await asyncio.to_thread(_do_update)
+        if status.startswith(("good", "nochg")):
+            await update.message.reply_text(
+                f"✅ DDNS updated.\nIP: `{current_ip}`\nStatus: `{status}`",
+                parse_mode="markdown",
+            )
         else:
-            await update.message.reply_text(f"❌ DDNS update failed (exit {proc.returncode}).\n`{output}`", parse_mode="markdown")
-    except FileNotFoundError:
-        await update.message.reply_text("❌ `noip-duc` not found. Is it installed?", parse_mode="markdown")
+            await update.message.reply_text(f"❌ DDNS update failed: `{status}`", parse_mode="markdown")
     except Exception as e:
         logger.error("Error in updateDDNS: %s", e)
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text("❌ DDNS update failed.")
 
 
 @check_authorization
