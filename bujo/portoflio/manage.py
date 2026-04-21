@@ -151,12 +151,12 @@ class PortfolioManager:
         )
         logger.info("USD → INR rate: %s", usd_to_inr)
 
-        ticker_data: Dict[str, Dict] = {}
+        ticker_data: Dict[tuple, Dict] = {}
         for tx in transactions:
             ticker    = tx.get("Ticker", "").strip()
             tx_type   = tx.get("TransactionType", "").strip()
             shares    = float(tx.get("NoOfShares") or 0)
-            cost      = float(tx.get("CostPerShare") or 0)   # always ₹
+            cost      = float(tx.get("CostPerShare") or 0)
             cmp       = float(tx.get("CMP") or 0)
             portfolio = tx.get("Portfolio", "Unknown").strip()
 
@@ -165,28 +165,29 @@ class PortfolioManager:
 
             is_inr   = ticker.upper().endswith(".NS")
             currency = "INR" if is_inr else "USD"
-            fx       = 1.0 if is_inr else usd_to_inr  # applies to both CMP and CostPerShare
+            fx       = 1.0 if is_inr else usd_to_inr
 
-            if ticker not in ticker_data:
-                ticker_data[ticker] = {
+            key = (ticker, portfolio)
+            if key not in ticker_data:
+                ticker_data[key] = {
                     "portfolio": portfolio, "currency": currency,
                     "total_bought": 0.0, "total_sold": 0.0,
                     "buy_cost_inr": 0.0, "sell_proceeds_inr": 0.0,
                     "cmp_inr": cmp * fx,
                 }
             if cmp:
-                ticker_data[ticker]["cmp_inr"] = cmp * fx
+                ticker_data[key]["cmp_inr"] = cmp * fx
             if tx_type == "Buy":
-                ticker_data[ticker]["total_bought"]       += shares
-                ticker_data[ticker]["buy_cost_inr"]       += shares * cost * fx
+                ticker_data[key]["total_bought"]       += shares
+                ticker_data[key]["buy_cost_inr"]       += shares * cost * fx
             elif tx_type == "Sell":
-                ticker_data[ticker]["total_sold"]          += shares
-                ticker_data[ticker]["sell_proceeds_inr"]   += shares * cost * fx
+                ticker_data[key]["total_sold"]          += shares
+                ticker_data[key]["sell_proceeds_inr"]   += shares * cost * fx
 
         open_tickers:   List[Dict] = []
         closed_tickers: List[Dict] = []
 
-        for ticker, d in ticker_data.items():
+        for (ticker, __), d in ticker_data.items():
             net_shares   = d["total_bought"] - d["total_sold"]
             avg_cost_inr = (d["buy_cost_inr"] / d["total_bought"]) if d["total_bought"] else 0.0
             cmp_inr      = d["cmp_inr"]
