@@ -97,7 +97,7 @@ async def _send_long(reply_func, text: str, **kwargs) -> None:
 
 expense_manager  = ExpenseManager(expenses_model, mag_model)
 mag_manager      = MagManager(mag_model)
-portfolio_manager = PortfolioManager(portfolio_transactions_model, mag_model)
+portfolio_manager = PortfolioManager(portfolio_transactions_model)
 
 wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 

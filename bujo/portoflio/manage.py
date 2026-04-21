@@ -1,12 +1,11 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 
 import yfinance as yf
 
 from bujo.models.portfolio_transactions import PortfolioTransactions
-from bujo.models.mag import MAG
 from bujo.base import llm
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
@@ -37,9 +36,9 @@ SYSTEM_PROMPT = [
     "Use Case 2: When the user wants to **list/view transactions**, follow these instructions:",
     "• Always send tool inputs as **JSON strings**.",
     "• Supported filters (NocoDB syntax): date range, ticker, transaction type.",
-    "• Example: 'Show my transactions for March 2025' → {{\"filters\": [\"(Date,ge,exactDate,2025-03-01)\", \"(Date,lt,exactDate,2025-04-01)\"]}}",
+    "• Example: 'Show my transactions for March 2025' → {{\"filters\": [\"(CreatedAt,ge,exactDate,2025-03-01)\", \"(CreatedAt,lt,exactDate,2025-04-01)\"]}}",
     "• Example: 'Show all sells of PFC.NS' → {{\"filters\": [\"(Ticker,eq,text,PFC.NS)\", \"(TransactionType,eq,text,Sell)\"]}}",
-    "• Example: 'Show all transactions today' → {{\"filters\": [\"(Date,eq,exactDate,{today_date})\"]}}",
+    "• Example: 'Show all transactions today' → {{\"filters\": [\"(CreatedAt,ge,exactDate,{today_date})\", \"(CreatedAt,lt,exactDate,{tomorrow_date})\"]}}",
     "• Example: 'List all transactions' → pass an empty string '' to fetch all.",
     "• Once fetched, summarise clearly grouped by Ticker or date as relevant. Show Ticker, Type, Shares, Cost, Date.",
 
@@ -53,9 +52,8 @@ SYSTEM_PROMPT = [
 
 
 class PortfolioManager:
-    def __init__(self, transactions_model: PortfolioTransactions, mag_model: MAG):
+    def __init__(self, transactions_model: PortfolioTransactions):
         self.transactions_model = transactions_model
-        self.mag_model = mag_model
 
         tools = [
             Tool(
@@ -73,8 +71,12 @@ class PortfolioManager:
         _memory = MemorySaver()
 
         def _state_modifier(state):
-            today = datetime.now().strftime("%Y-%m-%d %A")
-            content = "\n".join(SYSTEM_PROMPT).replace("{today_date}", today)
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d %A")
+            tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            content = ("\n".join(SYSTEM_PROMPT)
+                       .replace("{today_date}", today)
+                       .replace("{tomorrow_date}", tomorrow))
             return [SystemMessage(content=content)] + state["messages"]
 
         self.agent = create_react_agent(llm, tools, prompt=_state_modifier, checkpointer=_memory)
@@ -104,16 +106,6 @@ class PortfolioManager:
             if "failed" in str(response_add).lower():
                 logger.warning("Failed to add transaction entry.")
                 return "Failed to add transaction entry. Try again?"
-            date_val = data_object.get("Date")
-            if date_val:
-                mag_object = self.mag_model.find_by_date(date_val)
-                if mag_object:
-                    try:
-                        self.transactions_model.link_mag_to_transaction(response_add["Id"], mag_object["Id"])
-                        return "Transaction added and linked to MAG successfully"
-                    except Exception:
-                        logger.info("Transaction added but linking to MAG failed.")
-                        return "Transaction added but failed to link to MAG."
             return "Transaction added successfully"
         except Exception as e:
             logger.error("Error in add_transaction: %s", e, exc_info=True)
