@@ -42,6 +42,9 @@ from bujo.base import (
     openai_model,
     TEXT_TO_SPEECH_MODEL,
     portfolio_transactions_model,
+    NOIP_USERNAME,
+    NOIP_PASSWORD,
+    NOIP_HOSTNAME,
 )
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
@@ -340,6 +343,34 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @check_authorization
+async def updateDDNS(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    logger.info("updateDDNS from user %s", update.effective_user.id)
+    try:
+        import asyncio
+        proc = await asyncio.create_subprocess_exec(
+            "noip-duc",
+            "--username", NOIP_USERNAME,
+            "--password", NOIP_PASSWORD,
+            "-g", NOIP_HOSTNAME,
+            "--ip-method", "http://ip1.dynupdate6.no-ip.com/",
+            "--once",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode().strip() or "(no output)"
+        if proc.returncode == 0:
+            await update.message.reply_text(f"✅ DDNS updated.\n`{output}`", parse_mode="markdown")
+        else:
+            await update.message.reply_text(f"❌ DDNS update failed (exit {proc.returncode}).\n`{output}`", parse_mode="markdown")
+    except FileNotFoundError:
+        await update.message.reply_text("❌ `noip-duc` not found. Is it installed?", parse_mode="markdown")
+    except Exception as e:
+        logger.error("Error in updateDDNS: %s", e)
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+@check_authorization
 async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("wakeUpThePC from user %s", update.effective_user.id)
     try:
@@ -439,6 +470,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
+    app.add_handler(CommandHandler("updateDDNS", updateDDNS))
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
 

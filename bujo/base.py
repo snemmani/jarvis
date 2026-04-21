@@ -40,6 +40,9 @@ WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
 BROADCAST_IP = os.environ["BROADCAST_IP"]
 CHAT_ID = os.environ["CHAT_ID"]
+NOIP_USERNAME = os.environ["NOIP_USERNAME"]
+NOIP_PASSWORD = os.environ["NOIP_PASSWORD"]
+NOIP_HOSTNAME = os.environ["NOIP_HOSTNAME"]
 # Initializations
 _original_create_chat_result = ChatOpenAI._create_chat_result
 
