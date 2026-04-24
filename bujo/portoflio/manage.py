@@ -36,9 +36,9 @@ SYSTEM_PROMPT = [
     "Use Case 2: When the user wants to **list/view transactions**, follow these instructions:",
     "• Always send tool inputs as **JSON strings**.",
     "• Supported filters (NocoDB syntax): date range, ticker, transaction type.",
-    "• Example: 'Show my transactions for March 2025' → {{\"filters\": [\"(CreatedAt,ge,exactDate,2025-03-01)\", \"(CreatedAt,lt,exactDate,2025-04-01)\"]}}",
+    "• Example: 'Show my transactions for March 2025' → {{\"filters\": [\"(Date,ge,exactDate,2025-03-01)\", \"(Date,lt,exactDate,2025-04-01)\"]}}",
     "• Example: 'Show all sells of PFC.NS' → {{\"filters\": [\"(Ticker,eq,text,PFC.NS)\", \"(TransactionType,eq,text,Sell)\"]}}",
-    "• Example: 'Show all transactions today' → {{\"filters\": [\"(CreatedAt,ge,exactDate,{today_date})\", \"(CreatedAt,lt,exactDate,{tomorrow_date})\"]}}",
+    "• Example: 'Show all transactions today' → {{\"filters\": [\"(Date,ge,exactDate,{today_date})\", \"(Date,lt,exactDate,{tomorrow_date})\"]}}",
     "• Example: 'List all transactions' → pass an empty string '' to fetch all.",
     "• Once fetched, summarise clearly grouped by Ticker or date as relevant. Show Ticker, Type, Shares, Cost, Date.",
 
