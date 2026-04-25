@@ -13,3 +13,4 @@ litellm
 yfinance
 matplotlib
 debugpy
+fpdf2

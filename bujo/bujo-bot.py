@@ -5,11 +5,16 @@ import sys
 # script is run directly (VS Code / debugpy adds the script dir, not the root).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import asyncio
 import base64
+import io
 import json
 import logging
+import re
 import ssl
 from datetime import datetime
+
+from fpdf import FPDF
 
 import telegram
 import wolframalpha
@@ -106,6 +111,104 @@ wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
 # Persistent memory for the outer agent; survives agent reconstruction each message.
 _main_memory = MemorySaver()
+
+# Per-user Claude CLI session IDs — shared across /claudeApi and /portfolioSuggest.
+_claude_sessions: dict[int, str] = {}
+
+GRAHAM_PROMPT_PATH = "/home/bot/ai-prompts/GrahamPrompt.md"
+
+
+async def _keep_typing(chat_id: int, bot, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await bot.send_chat_action(chat_id, telegram.constants.ChatAction.TYPING)
+        except Exception:
+            pass
+        await asyncio.sleep(4)
+
+
+async def _run_claude(
+    prompt: str,
+    user_id: int,
+    allowed_tools: str | None = None,
+    timeout: int = 120,
+) -> str:
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if allowed_tools:
+        cmd += ["--allowedTools", allowed_tools]
+    session_id = _claude_sessions.get(user_id)
+    if session_id:
+        cmd += ["--resume", session_id]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd="/app",
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "⏱️ Request timed out. Please try again."
+
+    raw = stdout.decode().strip()
+    try:
+        data = json.loads(raw)
+        if data.get("session_id"):
+            _claude_sessions[user_id] = data["session_id"]
+        if data.get("is_error"):
+            _claude_sessions.pop(user_id, None)
+            return f"❌ Claude error: {data.get('result', 'unknown error')}"
+        return data.get("result", "") or stderr.decode().strip() or "No output."
+    except json.JSONDecodeError:
+        return raw or stderr.decode().strip() or "No output."
+
+
+def _report_to_pdf(text: str, title: str = "Portfolio Research Report") -> bytes:
+    safe = (
+        text.replace("₹", "Rs.")
+        .replace("━", "=")
+        .replace("─", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "--")
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+    safe = safe.encode("latin-1", errors="replace").decode("latin-1")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, title, ln=True, align="C")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%d %b %Y %I:%M %p IST')}", ln=True, align="C")
+    pdf.ln(4)
+
+    for line in safe.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            pdf.ln(2)
+        elif stripped.startswith("### "):
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.multi_cell(0, 6, stripped[4:])
+        elif stripped.startswith("## "):
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.multi_cell(0, 7, stripped[3:])
+        elif stripped.startswith("# "):
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.multi_cell(0, 8, stripped[2:])
+        else:
+            pdf.set_font("Helvetica", "", 9)
+            clean = re.sub(r'\*+([^*]+)\*+', r'\1', stripped)
+            clean = re.sub(r'`([^`]+)`', r'\1', clean)
+            pdf.multi_cell(0, 5, clean)
+
+    return bytes(pdf.output())
 
 # Static tools (no Telegram context needed)
 _static_tools = [
@@ -431,6 +534,94 @@ async def get_cmp_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @check_authorization
+async def claude_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("Usage: /claudeApi <your prompt>")
+        return
+    logger.info("claudeApi from user %s: %s", update.effective_user.id, prompt)
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing(update.effective_chat.id, context.bot, stop_typing)
+    )
+    try:
+        output = await _run_claude(prompt, update.effective_user.id, timeout=120)
+    except Exception as e:
+        logger.error("Error in claude_api: %s", e)
+        output = f"❌ Error running Claude: {e}"
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+    await _send_long(update.message.reply_text, output, parse_mode="markdown")
+
+
+@check_authorization
+async def portfolio_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Starting deep portfolio research... this may take a few minutes.")
+
+    try:
+        with open(GRAHAM_PROMPT_PATH, "r", encoding="utf-8") as f:
+            graham_prompt = f.read()
+    except FileNotFoundError:
+        await update.message.reply_text(f"❌ GrahamPrompt.md not found at {GRAHAM_PROMPT_PATH}.")
+        return
+
+    transactions = portfolio_transactions_model.list()
+    if not transactions:
+        await update.message.reply_text("❌ No portfolio transactions found.")
+        return
+
+    csv_lines = ["Portfolio,Ticker,TransactionType,NoOfShares,CostPerShare,Date,CMP"]
+    for tx in transactions:
+        csv_lines.append(
+            f"{tx.get('Portfolio','')},{tx.get('Ticker','')},{tx.get('TransactionType','')},"
+            f"{tx.get('NoOfShares','')},{tx.get('CostPerShare','')},{tx.get('Date','')},{tx.get('CMP','')}"
+        )
+
+    prompt = (
+        f"{graham_prompt}\n\n---\n# My Portfolio Transactions\n\n"
+        f"```csv\n{chr(10).join(csv_lines)}\n```\n\n"
+        "Use web search to fetch current market prices, latest financials, and recent news for each "
+        "holding. Generate the complete research report as specified above."
+    )
+
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing(update.effective_chat.id, context.bot, stop_typing)
+    )
+    try:
+        output = await _run_claude(
+            prompt,
+            update.effective_user.id,
+            allowed_tools="WebSearch,WebFetch",
+            timeout=300,
+        )
+    except Exception as e:
+        logger.error("Error in portfolio_suggest: %s", e, exc_info=True)
+        output = f"❌ Error: {e}"
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+
+    if output.startswith("❌") or output.startswith("⏱️"):
+        await update.message.reply_text(output)
+        return
+
+    try:
+        pdf_bytes = _report_to_pdf(output)
+        filename = f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption="📊 Portfolio Research Report",
+        )
+    except Exception as e:
+        logger.error("PDF generation failed: %s", e, exc_info=True)
+        await _send_long(update.message.reply_text, output, parse_mode="markdown")
+
+
+@check_authorization
 async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
@@ -476,6 +667,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("updateDDNS", updateDDNS))
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
+    app.add_handler(CommandHandler("claudeApi", claude_api))
+    app.add_handler(CommandHandler("portfolioSuggest", portfolio_suggest))
 
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
