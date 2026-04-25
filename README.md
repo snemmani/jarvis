@@ -65,7 +65,8 @@ Send it a text message, a voice note, or even a photo of a receipt — JARVIS fi
 ### 🔧 Utility Commands
 - `/wakeTheBeast` — Send a Wake-on-LAN magic packet to power on your PC remotely
 - `/genPass <length>` — Generate a cryptographically secure random password
-- `/updateDDNS` — Update your No-IP DDNS hostname with the current public IP
+- `/ddns update` — Update your No-IP DDNS hostname with the current public IPv6
+- `/ddns block` — Point the hostname to a mangled IPv6 to cut external access at will
 
 ### 🔒 Security
 - **User authorization** — only whitelisted Telegram user IDs can interact with the bot
@@ -347,7 +348,8 @@ docker build -t jarvis . && docker run -d --network=host --name jarvis \
 | `/portfolioSuggest` | Deep portfolio research: fetches all transactions + GrahamPrompt.md, runs web-researched Claude analysis, delivers a PDF report |
 | `/getProfitLoss` | Generate a full unrealised/realised P&L report across all portfolios |
 | `/updateTicker` | Manually trigger a CMP update for all tickers via yfinance |
-| `/updateDDNS` | Update No-IP DDNS hostname with the current public IP |
+| `/ddns update` | Update No-IP hostname to your current public IPv6 |
+| `/ddns block` | Mangle the last hex digit of your IPv6 to cut external access |
 | `/wakeTheBeast` | Send a Wake-on-LAN magic packet to power on your PC |
 | `/genPass <length>` | Generate a cryptographically secure random password |
 
