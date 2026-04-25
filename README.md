@@ -51,7 +51,7 @@ Send it a text message, a voice note, or even a photo of a receipt — JARVIS fi
 
 ### 🧠 Claude AI Dispatcher
 - **`/claudeApi <prompt>`** — dispatches any prompt to Claude Code CLI, maintains a **per-user conversation session** across calls (context is preserved between messages)
-- **`/portfolioSuggest`** — fetches all portfolio transactions, combines them with a detailed Graham/GARP investment analysis framework, runs a **deep web-research** session via Claude (WebSearch + WebFetch enabled), and delivers a **PDF research report** directly to your Telegram chat
+- **`/portfolioSuggest`** — fetches all portfolio transactions, combines them with a detailed prompt, runs a **deep web-research** session via Claude (WebSearch + WebFetch enabled), and delivers a **PDF research report** directly to your Telegram chat
 
 ### 🔍 Knowledge & Translation
 - **Wolfram Alpha integration** — math, science, conversions, nutrition, stock prices, flight fares, and more (returns visual pods as images)
