@@ -445,35 +445,68 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(file_name)
 
 
+def _mangle_ipv6(ip: str) -> str:
+    last = ip[-1]
+    mangled = format((int(last, 16) + 3) % 16, "x")
+    return ip[:-1] + mangled
+
+
+def _noip_set(ip: str) -> tuple[str, str]:
+    resp = requests.get(
+        "https://dynupdate.no-ip.com/nic/update",
+        params={"hostname": NOIP_HOSTNAME, "myip": ip},
+        auth=(NOIP_USERNAME, NOIP_PASSWORD),
+        headers={"User-Agent": "JARVISBot/1.0 " + NOIP_USERNAME},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return ip, resp.text.strip()
+
+
 @check_authorization
-async def updateDDNS(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    logger.info("updateDDNS from user %s", update.effective_user.id)
+async def ddns(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    subcommand = (_context.args[0].lower() if _context.args else "")
+    logger.info("ddns %s from user %s", subcommand, update.effective_user.id)
 
-    def _do_update() -> tuple[str, str]:
-        ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
-        resp = requests.get(
-            "https://dynupdate.no-ip.com/nic/update",
-            params={"hostname": NOIP_HOSTNAME, "myip": ip},
-            auth=(NOIP_USERNAME, NOIP_PASSWORD),
-            headers={"User-Agent": "JARVISBot/1.0 " + NOIP_USERNAME},
-            timeout=10,
+    if subcommand == "update":
+        def _do_update() -> tuple[str, str]:
+            ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
+            return _noip_set(ip)
+        try:
+            ip, status = await asyncio.to_thread(_do_update)
+            if status.startswith(("good", "nochg")):
+                await update.message.reply_text(
+                    f"✅ DDNS updated.\nIP: `{ip}`\nStatus: `{status}`",
+                    parse_mode="markdown",
+                )
+            else:
+                await update.message.reply_text(f"❌ DDNS update failed: `{status}`", parse_mode="markdown")
+        except Exception as e:
+            logger.error("Error in ddns update: %s", e)
+            await update.message.reply_text("❌ DDNS update failed.")
+
+    elif subcommand == "block":
+        def _do_block() -> tuple[str, str]:
+            real_ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
+            return _noip_set(_mangle_ipv6(real_ip))
+        try:
+            ip, status = await asyncio.to_thread(_do_block)
+            if status.startswith(("good", "nochg")):
+                await update.message.reply_text(
+                    f"🔒 DDNS blocked.\nHostname `{NOIP_HOSTNAME}` now points to `{ip}`.\nStatus: `{status}`",
+                    parse_mode="markdown",
+                )
+            else:
+                await update.message.reply_text(f"❌ DDNS block failed: `{status}`", parse_mode="markdown")
+        except Exception as e:
+            logger.error("Error in ddns block: %s", e)
+            await update.message.reply_text("❌ DDNS block failed.")
+
+    else:
+        await update.message.reply_text(
+            "Usage:\n`/ddns update` — set hostname to your current public IP\n`/ddns block` — point hostname to loopback to cut external access",
+            parse_mode="markdown",
         )
-        resp.raise_for_status()
-        return ip, resp.text.strip()
-
-    try:
-        import asyncio
-        current_ip, status = await asyncio.to_thread(_do_update)
-        if status.startswith(("good", "nochg")):
-            await update.message.reply_text(
-                f"✅ DDNS updated.\nIP: `{current_ip}`\nStatus: `{status}`",
-                parse_mode="markdown",
-            )
-        else:
-            await update.message.reply_text(f"❌ DDNS update failed: `{status}`", parse_mode="markdown")
-    except Exception as e:
-        logger.error("Error in updateDDNS: %s", e)
-        await update.message.reply_text("❌ DDNS update failed.")
 
 
 @check_authorization
@@ -594,7 +627,7 @@ async def portfolio_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt,
             update.effective_user.id,
             allowed_tools="WebSearch,WebFetch",
-            timeout=300,
+            timeout=1800,
         )
     except Exception as e:
         logger.error("Error in portfolio_suggest: %s", e, exc_info=True)
@@ -664,7 +697,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("wakeTheBeast", wakeUpThePC))
     app.add_handler(CommandHandler("genPass", genPass, has_args=1))
-    app.add_handler(CommandHandler("updateDDNS", updateDDNS))
+    app.add_handler(CommandHandler("ddns", ddns))
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     app.add_handler(CommandHandler("claudeApi", claude_api))
