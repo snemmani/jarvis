@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import ssl
+import uuid
 from datetime import datetime
 
 from fpdf import FPDF
@@ -275,10 +276,9 @@ async def _make_wolfram_tool(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def _make_analytics_tool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tool:
     async def analytics_tool(query: str) -> str:
-        import json as _json
         logger.info("Expense analytics request: %s", query)
         try:
-            params = _json.loads(query.replace("```json", "").replace("```", "").strip())
+            params = json.loads(query.replace("```json", "").replace("```", "").strip())
         except Exception:
             return "Invalid input. Expected JSON with start_date, end_date, and chart_type (pie or bar)."
 
@@ -300,28 +300,74 @@ async def _make_analytics_tool(update: Update, context: ContextTypes.DEFAULT_TYP
 
         grand_total = sum(float(e.get("Amount") or 0) for e in expenses)
         period_label = f"{start} to {end}" if start and end else "All Time"
+        chart_label = "Daily Spending" if chart_type == "bar" else "Spending Breakdown"
+        output_path = f"/tmp/chart_{uuid.uuid4().hex}.png"
+
+        chart_data = [
+            {"Date": e.get("Date"), "Item": e.get("Item"), "Amount": float(e.get("Amount") or 0)}
+            for e in expenses
+        ]
+
+        claude_prompt = (
+            f"You are a data visualization expert. Write a complete, self-contained Python script that:\n"
+            f"1. Creates a beautiful {'bar chart of daily spending totals' if chart_type == 'bar' else 'pie chart of spending by category (Item field)'} using plotly\n"
+            f"2. Uses only the hardcoded data below — do NOT read from files\n"
+            f"3. Saves the chart as PNG to exactly: {output_path}\n"
+            f"4. Uses template='plotly_dark' and a clean professional style\n"
+            f"5. Title: '{chart_label} — {period_label}', subtitle annotation: 'Total: Rs.{grand_total:,.0f}'\n"
+            f"6. Calls ONLY fig.write_image('{output_path}') — never fig.show()\n\n"
+            f"Data (JSON list of {{Date, Item, Amount}}):\n{json.dumps(chart_data)}\n\n"
+            f"Output ONLY the Python script. No explanation. No markdown fences."
+        )
 
         try:
-            if chart_type == "bar":
-                buf = spending_bar_chart(expenses, f"Daily Spending — {period_label}")
-                caption = f"📊 *Daily spending trend*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
-            else:
-                buf = spending_pie_chart(expenses, f"Spending Breakdown — {period_label}")
-                caption = f"🥧 *Category breakdown*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
+            script_raw = await _run_claude(claude_prompt, user_id=0, timeout=60)
+            script = re.sub(r"^```(?:python)?\s*", "", script_raw.strip(), flags=re.MULTILINE)
+            script = re.sub(r"\s*```$", "", script.strip(), flags=re.MULTILINE)
 
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=buf,
-                caption=caption,
-                parse_mode="markdown",
+            proc = await asyncio.create_subprocess_exec(
+                "python3", "-c", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            return (
-                f"Chart sent. {len(expenses)} transactions totalling ₹{grand_total:,.0f} "
-                f"for the period {period_label}."
-            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+
+            if proc.returncode != 0:
+                raise RuntimeError(stderr.decode())
+            if not os.path.exists(output_path):
+                raise FileNotFoundError("Chart file not generated.")
+
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=f,
+                    caption=f"📊 *{chart_label}*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}",
+                    parse_mode="markdown",
+                )
+            return f"Chart sent. {len(expenses)} transactions totalling ₹{grand_total:,.0f} for {period_label}."
+
         except Exception as e:
-            logger.error("Chart generation failed: %s", e, exc_info=True)
-            return f"Failed to generate chart: {e}"
+            logger.error("Claude chart failed, falling back to matplotlib: %s", e, exc_info=True)
+            try:
+                if chart_type == "bar":
+                    buf = spending_bar_chart(expenses, f"Daily Spending — {period_label}")
+                    caption = f"📊 *Daily spending trend*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
+                else:
+                    buf = spending_pie_chart(expenses, f"Spending Breakdown — {period_label}")
+                    caption = f"🥧 *Category breakdown*\nPeriod: {period_label}\nTotal: ₹{grand_total:,.0f}"
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=buf,
+                    caption=caption,
+                    parse_mode="markdown",
+                )
+                return f"Chart sent. {len(expenses)} transactions totalling ₹{grand_total:,.0f} for {period_label}."
+            except Exception as e2:
+                logger.error("Fallback chart also failed: %s", e2, exc_info=True)
+                return f"Failed to generate chart: {e}"
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
 
     return Tool(
         name="Expense_Analytics_Tool",
