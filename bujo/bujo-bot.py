@@ -43,6 +43,7 @@ from bujo.base import (
     WOLFRAM_APP_ID,
     PC_MAC_ADDRESS,
     BROADCAST_IP,
+    WAKE_RELAY_URL,
     scheduler,
     CHAT_ID,
     openai_model,
@@ -51,12 +52,16 @@ from bujo.base import (
     NOIP_USERNAME,
     NOIP_PASSWORD,
     NOIP_HOSTNAME,
+    SERP_API_KEY,
+    RESEARCH_MODEL,
 )
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from bujo.portoflio.manage import PortfolioManager
 from bujo.analytics.charts import spending_pie_chart, spending_bar_chart
-from wakeonlan import send_magic_packet
+from langchain_community.utilities import SerpAPIWrapper
+from langchain_community.callbacks import get_openai_callback
+from langchain_openai import ChatOpenAI
 import requests
 
 logger = logging.getLogger(__name__)
@@ -166,7 +171,12 @@ async def _run_claude(
         return raw or stderr.decode().strip() or "No output."
 
 
-def _report_to_pdf(text: str, title: str = "Portfolio Research Report") -> bytes:
+def _report_to_pdf(
+    text: str,
+    title: str = "Portfolio Research Report",
+    citations: list[str] | None = None,
+    usage: dict | None = None,
+) -> bytes:
     safe = (
         text.replace("₹", "Rs.")
         .replace("━", "=")
@@ -209,7 +219,104 @@ def _report_to_pdf(text: str, title: str = "Portfolio Research Report") -> bytes
             clean = re.sub(r'`([^`]+)`', r'\1', clean)
             pdf.multi_cell(0, 5, clean)
 
+    if citations:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.multi_cell(0, 7, "Sources & References")
+        pdf.set_font("Helvetica", "", 8)
+        for i, url in enumerate(citations, 1):
+            safe_url = url.encode("latin-1", errors="replace").decode("latin-1")
+            pdf.multi_cell(0, 5, f"[{i}] {safe_url}")
+
+    if usage:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.multi_cell(0, 7, "Research Statistics")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(0, 5, f"Model: {usage.get('model', RESEARCH_MODEL)}")
+        pdf.multi_cell(0, 5, f"Input tokens:  {usage.get('prompt_tokens', 0):,}")
+        pdf.multi_cell(0, 5, f"Output tokens: {usage.get('completion_tokens', 0):,}")
+        pdf.multi_cell(0, 5, f"Total tokens:  {usage.get('total_tokens', 0):,}")
+        if usage.get("total_cost"):
+            pdf.multi_cell(0, 5, f"Estimated cost: ${usage['total_cost']:.4f}")
+
     return bytes(pdf.output())
+
+
+_RESEARCH_SYSTEM_PROMPT = (
+    "You are a deep financial research analyst. When given a portfolio and research instructions, "
+    "you MUST perform multiple rounds of web searches to gather current data. "
+    "For each holding: search for current price, recent earnings, analyst ratings, and news. "
+    "Cross-reference multiple sources. Synthesize a comprehensive, citation-rich report. "
+    "Never fabricate data — only use what you find via search. "
+    "Structure the report with clear sections: Executive Summary, Per-Holding Analysis, "
+    "Portfolio Risk Assessment, and Recommendations."
+)
+
+
+async def _run_portfolio_research(
+    user_prompt: str,
+    system_prompt: str = _RESEARCH_SYSTEM_PROMPT,
+    timeout: int = 1800,
+) -> tuple[str, list[str], dict]:
+    sources: list[str] = []
+    serp = SerpAPIWrapper(serpapi_api_key=SERP_API_KEY)
+
+    def web_search(query: str) -> str:
+        result = serp.run(query)
+        try:
+            raw = serp.results(query)
+            for r in raw.get("organic_results", [])[:5]:
+                url = r.get("link", "")
+                if url and url not in sources:
+                    sources.append(url)
+        except Exception:
+            pass
+        return result
+
+    def fetch_page(url: str) -> str:
+        try:
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            text = re.sub(r"<[^>]+>", " ", resp.text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if url not in sources:
+                sources.append(url)
+            return text[:4000]
+        except Exception as e:
+            return f"Could not fetch {url}: {e}"
+
+    research_llm = ChatOpenAI(model=RESEARCH_MODEL)
+    tools = [
+        Tool(name="Web_Search", func=web_search,
+             description="Search the web for financial news, prices, and analysis."),
+        Tool(name="Fetch_Page", func=fetch_page,
+             description="Fetch the full content of a web page URL for detailed reading."),
+    ]
+
+    agent = create_react_agent(research_llm, tools, prompt=lambda state: (
+        [SystemMessage(content=system_prompt)] + state["messages"]
+    ))
+
+    with get_openai_callback() as cb:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                agent.invoke,
+                {"messages": [HumanMessage(content=user_prompt)]},
+            ),
+            timeout=timeout,
+        )
+
+    content = result["messages"][-1].content
+    usage = {
+        "model": RESEARCH_MODEL,
+        "prompt_tokens": cb.prompt_tokens,
+        "completion_tokens": cb.completion_tokens,
+        "total_tokens": cb.total_tokens,
+        "total_cost": cb.total_cost,
+    }
+    return content, sources, usage
+
 
 # Static tools (no Telegram context needed)
 _static_tools = [
@@ -559,11 +666,12 @@ async def ddns(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 async def wakeUpThePC(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("wakeUpThePC from user %s", update.effective_user.id)
     try:
-        send_magic_packet(PC_MAC_ADDRESS, ip_address=BROADCAST_IP)
+        resp = requests.get(WAKE_RELAY_URL, timeout=5)
+        resp.raise_for_status()
         await update.message.reply_text("🔌 Magic packet sent to wake up the PC.")
     except requests.RequestException as e:
-        logger.error("Error sending magic packet: %s", e)
-        await update.message.reply_text(f"Waking up the PC: {e}")
+        logger.error("Error sending magic packet via relay: %s", e)
+        await update.message.reply_text(f"Failed to wake PC: {e}")
 
 
 @check_authorization
@@ -657,43 +765,39 @@ async def portfolio_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{tx.get('NoOfShares','')},{tx.get('CostPerShare','')},{tx.get('Date','')},{tx.get('CMP','')}"
         )
 
-    prompt = (
-        f"{graham_prompt}\n\n---\n# My Portfolio Transactions\n\n"
+    user_prompt = (
+        f"# My Portfolio Transactions\n\n"
         f"```csv\n{chr(10).join(csv_lines)}\n```\n\n"
-        "Use web search to fetch current market prices, latest financials, and recent news for each "
-        "holding. Generate the complete research report as specified above."
+        "Search the web for current market prices, latest earnings, analyst ratings, and recent news "
+        "for each holding. Perform multiple searches per ticker. Generate the full research report."
     )
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(
         _keep_typing(update.effective_chat.id, context.bot, stop_typing)
     )
+    output, citations, usage = "", [], {}
     try:
-        output = await _run_claude(
-            prompt,
-            update.effective_user.id,
-            allowed_tools="WebSearch,WebFetch",
-            timeout=1800,
-        )
+        output, citations, usage = await _run_portfolio_research(user_prompt, system_prompt=graham_prompt, timeout=1800)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱️ Research timed out. Try again.")
+        return
     except Exception as e:
         logger.error("Error in portfolio_suggest: %s", e, exc_info=True)
-        output = f"❌ Error: {e}"
+        await update.message.reply_text(f"❌ Error: {e}")
+        return
     finally:
         stop_typing.set()
         typing_task.cancel()
 
-    if output.startswith("❌") or output.startswith("⏱️"):
-        await update.message.reply_text(output)
-        return
-
     try:
-        pdf_bytes = _report_to_pdf(output)
+        pdf_bytes = _report_to_pdf(output, citations=citations, usage=usage)
         filename = f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=io.BytesIO(pdf_bytes),
             filename=filename,
-            caption="📊 Portfolio Research Report",
+            caption=f"📊 Portfolio Research Report — {usage.get('total_tokens', 0):,} tokens used",
         )
     except Exception as e:
         logger.error("PDF generation failed: %s", e, exc_info=True)

@@ -58,30 +58,40 @@ class ExpenseManager:
             ),
         ]
 
-        _memory = MemorySaver()
+        self._tools = tools
+        self._build_agent()
+        logger.info("ExpenseManager initialized successfully")
 
+    def _build_agent(self):
         def _state_modifier(state):
             today = datetime.now().strftime("%Y-%m-%d %A")
             content = "\n".join(SYSTEM_PROMPT).replace("{today_date}", today)
             return [SystemMessage(content=content)] + state["messages"]
 
-        self.agent = create_react_agent(llm, tools, prompt=_state_modifier, checkpointer=_memory)
-        logger.info("ExpenseManager initialized successfully")
+        self.agent = create_react_agent(llm, self._tools, prompt=_state_modifier, checkpointer=MemorySaver())
 
     def agent_expenses(self, prompt: str) -> str:
         text = prompt.strip()
         logger.info("Received prompt: %s", text)
-        try:
-            result = self.agent.invoke(
-                {"messages": [HumanMessage(content=text)]},
-                config={"configurable": {"thread_id": "expenses"}},
-            )
-            output = result["messages"][-1].content
-            logger.info("Agent response: %s", output)
-            return output
-        except Exception as e:
-            logger.error("Error in agent_expenses: %s", e, exc_info=True)
-            return "Sorry, there was an error processing your request."
+        for attempt in range(2):
+            try:
+                result = self.agent.invoke(
+                    {"messages": [HumanMessage(content=text)]},
+                    config={"configurable": {"thread_id": "expenses"}},
+                )
+                output = result["messages"][-1].content
+                logger.info("Agent response: %s", output)
+                return output
+            except ValueError as e:
+                if "INVALID_CHAT_HISTORY" in str(e) and attempt == 0:
+                    logger.warning("Corrupt expenses chat history — resetting memory and retrying.")
+                    self._build_agent()
+                    continue
+                logger.error("Error in agent_expenses: %s", e, exc_info=True)
+                return "Sorry, there was an error processing your request."
+            except Exception as e:
+                logger.error("Error in agent_expenses: %s", e, exc_info=True)
+                return "Sorry, there was an error processing your request."
 
     def add_expense(self, data: str) -> str:
         logger.info("Adding expense with data: %s", data)

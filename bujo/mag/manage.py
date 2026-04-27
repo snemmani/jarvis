@@ -61,27 +61,37 @@ class MagManager:
             ),
         ]
 
-        _memory = MemorySaver()
+        self._tools = tools
+        self._build_agent()
+        logger.info("MagManager initialized.")
 
+    def _build_agent(self):
         def _state_modifier(state):
             today = datetime.now().strftime("%Y-%m-%d %A")
             content = "\n".join(SYSTEM_PROMPT) + f"\nToday's date is {today}."
             return [SystemMessage(content=content)] + state["messages"]
 
-        self.agent = create_react_agent(llm, tools, prompt=_state_modifier, checkpointer=_memory)
-        logger.info("MagManager initialized.")
+        self.agent = create_react_agent(llm, self._tools, prompt=_state_modifier, checkpointer=MemorySaver())
 
     def agent_mag(self, prompt: str) -> str:
         text = prompt.strip()
         logger.info("Received prompt: %s", text)
-        try:
-            result = self.agent.invoke(
-                {"messages": [HumanMessage(content=text)]},
-                config={"configurable": {"thread_id": "mag"}},
-            )
-            output = result["messages"][-1].content
-            logger.info("Agent response: %s", output)
-            return output
-        except Exception as e:
-            logger.error("Error in agent_mag: %s", e, exc_info=True)
-            return "An error occurred while processing your request."
+        for attempt in range(2):
+            try:
+                result = self.agent.invoke(
+                    {"messages": [HumanMessage(content=text)]},
+                    config={"configurable": {"thread_id": "mag"}},
+                )
+                output = result["messages"][-1].content
+                logger.info("Agent response: %s", output)
+                return output
+            except ValueError as e:
+                if "INVALID_CHAT_HISTORY" in str(e) and attempt == 0:
+                    logger.warning("Corrupt MAG chat history — resetting memory and retrying.")
+                    self._build_agent()
+                    continue
+                logger.error("Error in agent_mag: %s", e, exc_info=True)
+                return "An error occurred while processing your request."
+            except Exception as e:
+                logger.error("Error in agent_mag: %s", e, exc_info=True)
+                return "An error occurred while processing your request."
