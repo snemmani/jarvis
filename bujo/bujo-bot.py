@@ -10,18 +10,21 @@ import base64
 import io
 import json
 import logging
+import queue as _queue_mod
 import re
 import ssl
 import uuid
 from datetime import datetime
 
-from fpdf import FPDF
+from fpdf import FPDF, XPos, YPos
 
 import telegram
 import wolframalpha
 from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -30,7 +33,7 @@ from telegram.ext import (
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_react_agent
 from apscheduler.triggers.cron import CronTrigger
 
 from bujo.base import (
@@ -52,16 +55,14 @@ from bujo.base import (
     NOIP_USERNAME,
     NOIP_PASSWORD,
     NOIP_HOSTNAME,
-    SERP_API_KEY,
     RESEARCH_MODEL,
 )
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from bujo.portoflio.manage import PortfolioManager
 from bujo.analytics.charts import spending_pie_chart, spending_bar_chart
-from langchain_community.utilities import SerpAPIWrapper
-from langchain_community.callbacks import get_openai_callback
 from langchain_openai import ChatOpenAI
+from langchain_core.callbacks import BaseCallbackHandler
 import requests
 
 logger = logging.getLogger(__name__)
@@ -83,12 +84,25 @@ SYSTEM_PROMPT = [
     "Use emojis wherever appropriate to make the response more friendly and visually appealing. 🎯🧮📅💸📰🌐🔢📊🖼️🔤",
 ]
 
-# Configure logging
+# Configure logging with error handling for closed streams
+class SafeStreamHandler(logging.StreamHandler):
+    """StreamHandler that ignores ValueError from closed streams."""
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except ValueError as e:
+            if "I/O operation on closed file" in str(e):
+                pass  # Ignore closed file errors during shutdown
+            else:
+                raise
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[SafeStreamHandler(sys.stdout)],
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _TG_MAX = 4096  # Telegram hard limit per message
 
@@ -120,6 +134,7 @@ _main_memory = MemorySaver()
 
 # Per-user Claude CLI session IDs — shared across /claudeApi and /portfolioSuggest.
 _claude_sessions: dict[int, str] = {}
+_research_input_queues: dict[int, _queue_mod.Queue] = {}
 
 GRAHAM_PROMPT_PATH = "/home/bot/ai-prompts/GrahamPrompt.md"
 
@@ -177,47 +192,58 @@ def _report_to_pdf(
     citations: list[str] | None = None,
     usage: dict | None = None,
 ) -> bytes:
-    safe = (
-        text.replace("₹", "Rs.")
-        .replace("━", "=")
-        .replace("─", "-")
-        .replace("\u2013", "-")
-        .replace("\u2014", "--")
-        .replace("\u2019", "'")
-        .replace("\u2018", "'")
-        .replace("\u201c", '"')
-        .replace("\u201d", '"')
-    )
-    safe = safe.encode("latin-1", errors="replace").decode("latin-1")
+    def _sanitise(s: str) -> str:
+        s = (
+            s.replace("₹", "Rs.")
+            .replace("━", "=")
+            .replace("─", "-")
+            .replace("\u2013", "-")
+            .replace("\u2014", "--")
+            .replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2022", "-")
+            .replace("\u2026", "...")
+        )
+        # Strip control characters except newline/tab
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+        return s.encode("latin-1", errors="replace").decode("latin-1")
+
+    safe = _sanitise(text)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, title, ln=True, align="C")
+    pdf.cell(0, 10, _sanitise(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%d %b %Y %I:%M %p IST')}", ln=True, align="C")
+    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%d %b %Y %I:%M %p IST')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(4)
 
     for line in safe.split("\n"):
         stripped = line.strip()
         if not stripped:
             pdf.ln(2)
-        elif stripped.startswith("### "):
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.multi_cell(0, 6, stripped[4:])
-        elif stripped.startswith("## "):
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.multi_cell(0, 7, stripped[3:])
-        elif stripped.startswith("# "):
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.multi_cell(0, 8, stripped[2:])
-        else:
-            pdf.set_font("Helvetica", "", 9)
-            clean = re.sub(r'\*+([^*]+)\*+', r'\1', stripped)
-            clean = re.sub(r'`([^`]+)`', r'\1', clean)
-            pdf.multi_cell(0, 5, clean)
+            continue
+        try:
+            if stripped.startswith("### "):
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.multi_cell(0, 6, stripped[4:])
+            elif stripped.startswith("## "):
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.multi_cell(0, 7, stripped[3:])
+            elif stripped.startswith("# "):
+                pdf.set_font("Helvetica", "B", 14)
+                pdf.multi_cell(0, 8, stripped[2:])
+            else:
+                pdf.set_font("Helvetica", "", 9)
+                clean = re.sub(r'\*+([^*]+)\*+', r'\1', stripped)
+                clean = re.sub(r'`([^`]+)`', r'\1', clean)
+                pdf.multi_cell(0, 5, clean)
+        except Exception:
+            pass  # skip any unprintable line rather than crashing the whole PDF
 
     if citations:
         pdf.ln(4)
@@ -226,7 +252,18 @@ def _report_to_pdf(
         pdf.set_font("Helvetica", "", 8)
         for i, url in enumerate(citations, 1):
             safe_url = url.encode("latin-1", errors="replace").decode("latin-1")
-            pdf.multi_cell(0, 5, f"[{i}] {safe_url}")
+            # Wrap long URLs to prevent FPDFException
+            try:
+                pdf.multi_cell(0, 5, f"[{i}] {safe_url}")
+            except Exception:
+                # If URL is too long, truncate it
+                max_len = 100
+                truncated = safe_url[:max_len] + "..." if len(safe_url) > max_len else safe_url
+                try:
+                    pdf.multi_cell(0, 5, f"[{i}] {truncated}")
+                except Exception:
+                    # Last resort: skip this citation
+                    pass
 
     if usage:
         pdf.ln(4)
@@ -241,6 +278,36 @@ def _report_to_pdf(
             pdf.multi_cell(0, 5, f"Estimated cost: ${usage['total_cost']:.4f}")
 
     return bytes(pdf.output())
+
+
+class _TelegramProgressCallback(BaseCallbackHandler):
+    """Sends agent tool-call steps as Telegram messages so the user sees live progress."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, bot, chat_id: int):
+        super().__init__()
+        self._loop = loop
+        self._bot = bot
+        self._chat_id = chat_id
+        self._step = 0
+
+    def _send(self, text: str):
+        asyncio.run_coroutine_threadsafe(
+            self._bot.send_message(chat_id=self._chat_id, text=text, parse_mode="Markdown"),
+            self._loop,
+        )
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        self._step += 1
+        tool = serialized.get("name", "tool")
+        preview = str(input_str)[:200].replace("`", "'")
+        self._send(f"🔍 *Step {self._step} — {tool}*\n`{preview}`")
+
+    def on_tool_end(self, output, **kwargs):
+        preview = re.sub(r"[*_`\[\]]", "", str(output)[:300])
+        self._send(f"📋 *Result preview:* {preview}")
+
+    def on_agent_finish(self, finish, **kwargs):
+        self._send("✅ *Research complete — generating PDF...*")
 
 
 _RESEARCH_SYSTEM_PROMPT = (
@@ -258,64 +325,178 @@ async def _run_portfolio_research(
     user_prompt: str,
     system_prompt: str = _RESEARCH_SYSTEM_PROMPT,
     timeout: int = 1800,
+    bot=None,
+    chat_id: int | None = None,
+    user_id: int | None = None,
 ) -> tuple[str, list[str], dict]:
-    sources: list[str] = []
-    serp = SerpAPIWrapper(serpapi_api_key=SERP_API_KEY)
-
-    def web_search(query: str) -> str:
-        result = serp.run(query)
-        try:
-            raw = serp.results(query)
-            for r in raw.get("organic_results", [])[:5]:
-                url = r.get("link", "")
-                if url and url not in sources:
-                    sources.append(url)
-        except Exception:
-            pass
-        return result
-
-    def fetch_page(url: str) -> str:
-        try:
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            text = re.sub(r"<[^>]+>", " ", resp.text)
-            text = re.sub(r"\s+", " ", text).strip()
-            if url not in sources:
-                sources.append(url)
-            return text[:4000]
-        except Exception as e:
-            return f"Could not fetch {url}: {e}"
-
-    research_llm = ChatOpenAI(model=RESEARCH_MODEL)
-    tools = [
-        Tool(name="Web_Search", func=web_search,
-             description="Search the web for financial news, prices, and analysis."),
-        Tool(name="Fetch_Page", func=fetch_page,
-             description="Fetch the full content of a web page URL for detailed reading."),
-    ]
-
-    agent = create_react_agent(research_llm, tools, prompt=lambda state: (
-        [SystemMessage(content=system_prompt)] + state["messages"]
-    ))
-
-    with get_openai_callback() as cb:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                agent.invoke,
-                {"messages": [HumanMessage(content=user_prompt)]},
-            ),
-            timeout=timeout,
+    """Run portfolio research using OpenAI's native web search and code interpreter tools."""
+    
+    logger.info("portfolio_research: starting with OpenAI native tools, model=%s", RESEARCH_MODEL)
+    
+    # Send progress updates to Telegram
+    async def send_progress(message: str):
+        if bot and chat_id:
+            try:
+                await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("Failed to send progress update: %s", e)
+    
+    await send_progress("🔍 Starting research with web search and analysis tools...")
+    
+    try:
+        # Create assistant with native tools
+        assistant = openai_model.beta.assistants.create(
+            name="Portfolio Research Analyst",
+            instructions=system_prompt,
+            model=RESEARCH_MODEL,
+            tools=[
+                {"type": "web_search"},
+                {"type": "code_interpreter"}
+            ]
         )
-
-    content = result["messages"][-1].content
-    usage = {
-        "model": RESEARCH_MODEL,
-        "prompt_tokens": cb.prompt_tokens,
-        "completion_tokens": cb.completion_tokens,
-        "total_tokens": cb.total_tokens,
-        "total_cost": cb.total_cost,
-    }
-    return content, sources, usage
+        
+        # Create thread
+        thread = openai_model.beta.threads.create()
+        
+        # Add user message
+        openai_model.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=user_prompt
+        )
+        
+        await send_progress("📊 Analyzing portfolio data...")
+        
+        # Run the assistant
+        run = openai_model.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=assistant.id
+        )
+        
+        # Poll for completion with progress updates
+        last_status = None
+        start_time = asyncio.get_event_loop().time()
+        
+        while True:
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                openai_model.beta.threads.runs.cancel(thread_id=thread.id, run_id=run.id)
+                raise asyncio.TimeoutError("Research timed out")
+            
+            run_status = openai_model.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id
+            )
+            
+            # Send status updates
+            if run_status.status != last_status:
+                status_messages = {
+                    "queued": "⏳ Research queued...",
+                    "in_progress": "🔬 Research in progress...",
+                    "requires_action": "❓ Needs additional input...",
+                    "completed": "✅ Research completed!",
+                    "failed": "❌ Research failed",
+                    "cancelled": "🚫 Research cancelled",
+                    "expired": "⏰ Research expired"
+                }
+                if run_status.status in status_messages:
+                    await send_progress(status_messages[run_status.status])
+                last_status = run_status.status
+            
+            if run_status.status == "completed":
+                break
+            elif run_status.status in ["failed", "cancelled", "expired"]:
+                error_msg = getattr(run_status, "last_error", {}).get("message", "Unknown error")
+                raise RuntimeError(f"Research {run_status.status}: {error_msg}")
+            elif run_status.status == "requires_action":
+                # Handle function calls if needed (e.g., human_input)
+                required_action = run_status.required_action
+                if required_action and required_action.type == "submit_tool_outputs":
+                    tool_outputs = []
+                    for tool_call in required_action.submit_tool_outputs.tool_calls:
+                        if tool_call.function.name == "human_input":
+                            # Ask user for input
+                            args = json.loads(tool_call.function.arguments)
+                            question = args.get("question", "Need clarification")
+                            
+                            await send_progress(f"❓ *Agent needs input:*\n{question}\n\n_Reply to continue research._")
+                            
+                            q = _research_input_queues.get(user_id) if user_id else None
+                            if q:
+                                try:
+                                    answer = q.get(timeout=300)
+                                except _queue_mod.Empty:
+                                    answer = "No response — proceed with available data"
+                            else:
+                                answer = "Unable to get user input — proceed with available data"
+                            
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": answer
+                            })
+                    
+                    if tool_outputs:
+                        openai_model.beta.threads.runs.submit_tool_outputs(
+                            thread_id=thread.id,
+                            run_id=run.id,
+                            tool_outputs=tool_outputs
+                        )
+            
+            await asyncio.sleep(2)
+        
+        # Get the messages
+        messages = openai_model.beta.threads.messages.list(
+            thread_id=thread.id,
+            order="asc"
+        )
+        
+        # Extract the assistant's response
+        assistant_messages = [msg for msg in messages.data if msg.role == "assistant"]
+        if not assistant_messages:
+            raise RuntimeError("No response from assistant")
+        
+        final_message = assistant_messages[-1]
+        
+        # Extract text content
+        content_parts = []
+        for content_block in final_message.content:
+            if content_block.type == "text":
+                content_parts.append(content_block.text.value)
+        
+        output = "\n\n".join(content_parts)
+        
+        # Extract citations/sources from annotations
+        sources = []
+        for content_block in final_message.content:
+            if content_block.type == "text" and hasattr(content_block.text, "annotations"):
+                for annotation in content_block.text.annotations:
+                    if hasattr(annotation, "url"):
+                        url = annotation.url
+                        if url and url not in sources:
+                            sources.append(url)
+        
+        # Get usage statistics
+        usage = {
+            "model": RESEARCH_MODEL,
+            "prompt_tokens": run_status.usage.prompt_tokens if hasattr(run_status, "usage") else 0,
+            "completion_tokens": run_status.usage.completion_tokens if hasattr(run_status, "usage") else 0,
+            "total_tokens": run_status.usage.total_tokens if hasattr(run_status, "usage") else 0,
+        }
+        
+        logger.info("portfolio_research: completed, sources=%d, tokens=%d", 
+                   len(sources), usage["total_tokens"])
+        
+        # Cleanup
+        try:
+            openai_model.beta.assistants.delete(assistant.id)
+            openai_model.beta.threads.delete(thread.id)
+        except Exception as e:
+            logger.warning("Failed to cleanup assistant/thread: %s", e)
+        
+        return output, sources, usage
+        
+    except Exception as e:
+        logger.error("portfolio_research: failed with error: %s", e, exc_info=True)
+        raise
 
 
 # Static tools (no Telegram context needed)
@@ -497,6 +678,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @check_authorization
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in _research_input_queues:
+        _research_input_queues[user_id].put(update.message.text.strip())
+        await update.message.reply_text("✅ Got it — continuing research...")
+        return
     await agent_engage(update, context, update.message.text.strip())
 
 
@@ -772,13 +958,23 @@ async def portfolio_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "for each holding. Perform multiple searches per ticker. Generate the full research report."
     )
 
+    user_id = update.effective_user.id
+    _research_input_queues[user_id] = _queue_mod.Queue()
+
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(
         _keep_typing(update.effective_chat.id, context.bot, stop_typing)
     )
     output, citations, usage = "", [], {}
     try:
-        output, citations, usage = await _run_portfolio_research(user_prompt, system_prompt=graham_prompt, timeout=1800)
+        output, citations, usage = await _run_portfolio_research(
+            user_prompt,
+            system_prompt=graham_prompt,
+            timeout=1800,
+            bot=context.bot,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+        )
     except asyncio.TimeoutError:
         await update.message.reply_text("⏱️ Research timed out. Try again.")
         return
@@ -787,21 +983,54 @@ async def portfolio_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {e}")
         return
     finally:
+        _research_input_queues.pop(user_id, None)
         stop_typing.set()
         typing_task.cancel()
 
+    # Send research text first so user can review
+    await _send_long(update.message.reply_text, output)
+
+    # Store for PDF callback and ask for confirmation
+    context.bot_data[f"research_{user_id}"] = (output, citations, usage)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📄 Generate PDF", callback_data=f"portfolio_pdf_yes_{user_id}"),
+        InlineKeyboardButton("❌ Skip", callback_data=f"portfolio_pdf_no_{user_id}"),
+    ]])
+    await update.message.reply_text(
+        "Research complete. Would you like a PDF report?",
+        reply_markup=keyboard,
+    )
+
+
+async def portfolio_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # e.g. "portfolio_pdf_yes_12345"
+
+    if "_no_" in data:
+        await query.edit_message_text("PDF skipped.")
+        return
+
+    user_id = int(data.split("_")[-1])
+    stored = context.bot_data.pop(f"research_{user_id}", None)
+    if not stored:
+        await query.edit_message_text("Session expired. Run /portfolioSuggest again.")
+        return
+
+    await query.edit_message_text("⏳ Generating PDF...")
+    output, citations, usage = stored
     try:
         pdf_bytes = _report_to_pdf(output, citations=citations, usage=usage)
         filename = f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
         await context.bot.send_document(
-            chat_id=update.effective_chat.id,
+            chat_id=query.message.chat_id,
             document=io.BytesIO(pdf_bytes),
             filename=filename,
             caption=f"📊 Portfolio Research Report — {usage.get('total_tokens', 0):,} tokens used",
         )
     except Exception as e:
         logger.error("PDF generation failed: %s", e, exc_info=True)
-        await _send_long(update.message.reply_text, output, parse_mode="markdown")
+        await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ PDF failed: {e}")
 
 
 @check_authorization
@@ -852,6 +1081,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     app.add_handler(CommandHandler("claudeApi", claude_api))
     app.add_handler(CommandHandler("portfolioSuggest", portfolio_suggest))
+    app.add_handler(CallbackQueryHandler(portfolio_pdf_callback, pattern=r"^portfolio_pdf_"))
 
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
