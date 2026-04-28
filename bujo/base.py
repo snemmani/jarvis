@@ -39,7 +39,6 @@ WOLFRAM_APP_ID = os.environ["WOLFRAM_APP_ID"]
 PC_MAC_ADDRESS = os.environ["PC_MAC_ADDRESS"]
 BROADCAST_IP = os.environ["BROADCAST_IP"]
 WAKE_RELAY_URL = os.environ.get("WAKE_RELAY_URL", "http://172.17.0.1:9393/wake")
-RESEARCH_MODEL = os.environ.get("RESEARCH_MODEL", "gpt-5.4")
 CHAT_ID = os.environ["CHAT_ID"]
 NOIP_USERNAME = os.environ["NOIP_USERNAME"]
 NOIP_PASSWORD = os.environ["NOIP_PASSWORD"]

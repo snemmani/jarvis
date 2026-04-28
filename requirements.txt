@@ -13,7 +13,4 @@ litellm
 yfinance
 matplotlib
 debugpy
-fpdf2
-plotly
-kaleido
 google-search-results
