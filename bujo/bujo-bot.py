@@ -11,13 +11,15 @@ import json
 import logging
 import re
 import ssl
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import telegram
 import wolframalpha
-from telegram import Update
+import yfinance as yf
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -45,6 +47,7 @@ from bujo.base import (
     openai_model,
     TEXT_TO_SPEECH_MODEL,
     portfolio_transactions_model,
+    price_alerts_model,
     NOIP_USERNAME,
     NOIP_PASSWORD,
     NOIP_HOSTNAME,
@@ -53,6 +56,7 @@ from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from bujo.portoflio.manage import PortfolioManager
 from bujo.portoflio.alerts import run_portfolio_alerts
+from bujo.portoflio.rebalance import run_rebalance_analysis
 from bujo.analytics.charts import spending_pie_chart, spending_bar_chart
 from langchain_openai import ChatOpenAI
 import requests
@@ -123,6 +127,9 @@ wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 
 # Persistent memory for the outer agent; survives agent reconstruction each message.
 _main_memory = MemorySaver()
+
+# alert_id -> datetime until which the alert is snoozed
+_alert_snooze: dict[int, datetime] = {}
 
 
 # Static tools (no Telegram context needed)
@@ -490,6 +497,84 @@ async def get_profit_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @check_authorization
+async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /setAlert <ticker> <above|below|both> <price> [action notes]"""
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage: `/setAlert <ticker> <above|below|both> <price> [action notes]`\n"
+            "Example: `/setAlert INFY.NS above 1800 Sell 50 shares`",
+            parse_mode="Markdown",
+        )
+        return
+    ticker, direction, price_str = args[0].upper(), args[1].lower(), args[2]
+    action = " ".join(args[3:])
+    if direction not in ("above", "below", "both"):
+        await update.message.reply_text("Direction must be `above`, `below`, or `both`.", parse_mode="Markdown")
+        return
+    try:
+        target_price = float(price_str)
+    except ValueError:
+        await update.message.reply_text("Price must be a number.")
+        return
+    result = price_alerts_model.create(ticker, direction, target_price, action)
+    if result:
+        action_line = f"\n📝 _{action}_" if action else ""
+        await update.message.reply_text(
+            f"✅ Alert set: *{ticker}* {direction} ₹{target_price:,.2f}{action_line}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("❌ Failed to create alert. Try again.")
+
+
+@check_authorization
+async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alerts = price_alerts_model.list_active()
+    if not alerts:
+        await update.message.reply_text("No active price alerts.")
+        return
+    for alert in alerts:
+        alert_id = alert.get("Id")
+        ticker = alert.get("Ticker", "?")
+        direction = alert.get("Direction", "?")
+        target = alert.get("TargetPrice", 0)
+        action = (alert.get("Action") or "").strip()
+        action_line = f"\n📝 _{action}_" if action else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💤 Snooze 2h", callback_data=f"pal_snooze_{alert_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"pal_cancel_{alert_id}"),
+        ]])
+        await update.message.reply_text(
+            f"🔔 *{ticker}* — {direction} ₹{target:,.2f}{action_line}",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+
+async def price_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("pal_snooze_"):
+        alert_id = int(data.split("_")[-1])
+        _alert_snooze[alert_id] = datetime.now() + timedelta(hours=2)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"💤 Alert snoozed for 2 hours.")
+
+    elif data.startswith("pal_cancel_"):
+        alert_id = int(data.split("_")[-1])
+        ok = price_alerts_model.deactivate(alert_id)
+        _alert_snooze.pop(alert_id, None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        if ok:
+            await query.message.reply_text("🗑️ Alert cancelled.")
+        else:
+            await query.message.reply_text("❌ Failed to cancel alert.")
+
+
+@check_authorization
 async def portfolio_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("portfolioAlerts from user %s", update.effective_user.id)
     await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
@@ -502,6 +587,36 @@ async def portfolio_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Error in portfolio_alerts: %s", e, exc_info=True)
         await update.message.reply_text(f"❌ Error running alerts: {e}")
+
+
+@check_authorization
+async def rebalance_recommendations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("rebalanceRecommendations from user %s", update.effective_user.id)
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+    await update.message.reply_text(
+        "⏳ Running full portfolio rebalance analysis… this may take a minute."
+    )
+    try:
+        report_path, input_path, usage_msg = await asyncio.to_thread(
+            run_rebalance_analysis, portfolio_transactions_model
+        )
+        for path, caption in [
+            (input_path,  "📋 Input prompt — portfolio data + market context for fact-checking"),
+            (report_path, "📄 Rebalance report — open in any Markdown viewer"),
+        ]:
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=os.path.basename(path),
+                        caption=caption,
+                    )
+                os.remove(path)
+        await update.message.reply_text(usage_msg)
+    except Exception as e:
+        logger.error("Error in rebalanceRecommendations: %s", e, exc_info=True)
+        await update.message.reply_text(f"❌ Error running rebalance analysis: {e}")
 
 
 async def setup_scheduler(application):
@@ -534,6 +649,84 @@ async def setup_scheduler(application):
         scheduled_portfolio_alerts,
         CronTrigger(hour="9", minute="0"),
     )
+
+    async def scheduled_price_alerts():
+        try:
+            alerts = price_alerts_model.list_active()
+            now = datetime.now()
+            for alert in alerts:
+                alert_id = alert.get("Id")
+                ticker = alert.get("Ticker", "")
+                direction = alert.get("Direction", "")
+                target = float(alert.get("TargetPrice") or 0)
+
+                # Skip if snoozed
+                if alert_id in _alert_snooze and now < _alert_snooze[alert_id]:
+                    continue
+
+                cmp = yf.Ticker(ticker).info.get("currentPrice") or 0
+                if not cmp:
+                    continue
+
+                triggered = (
+                    (direction == "above" and cmp >= target) or
+                    (direction == "below" and cmp <= target) or
+                    (direction == "both" and cmp != target)
+                )
+                if not triggered:
+                    continue
+
+                arrow = "📈" if cmp >= target else "📉"
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💤 Snooze 2h", callback_data=f"pal_snooze_{alert_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"pal_cancel_{alert_id}"),
+                ]])
+                action = (alert.get("Action") or "").strip()
+                action_line = f"\n📝 _{action}_" if action else ""
+                await application.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🔔 *Price Alert — {ticker}*\n"
+                        f"{arrow} CMP ₹{cmp:,.2f} is {direction} target ₹{target:,.2f}"
+                        f"{action_line}"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+        except Exception as e:
+            logger.error("Error in scheduled price alerts: %s", e)
+
+    scheduler.add_job(
+        scheduled_price_alerts,
+        CronTrigger(hour="9,11,13,15", minute="0", day_of_week="0-4"),
+    )
+    async def scheduled_rebalance():
+        try:
+            report_path, input_path, usage_msg = await asyncio.to_thread(
+                run_rebalance_analysis, portfolio_transactions_model
+            )
+            for path, caption in [
+                (input_path,  "📋 Input prompt — portfolio data + market context for fact-checking"),
+                (report_path, "📄 Monthly rebalance report — open in any Markdown viewer"),
+            ]:
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        await application.bot.send_document(
+                            chat_id=CHAT_ID,
+                            document=f,
+                            filename=os.path.basename(path),
+                            caption=caption,
+                        )
+                    os.remove(path)
+            await application.bot.send_message(chat_id=CHAT_ID, text=usage_msg)
+        except Exception as e:
+            logger.error("Error in scheduled rebalance: %s", e)
+
+    scheduler.add_job(
+        scheduled_rebalance,
+        CronTrigger(day=1, hour=9, minute=30),
+    )
+
     scheduler.start()
     logger.info("🕒 Scheduler started.")
 
@@ -552,6 +745,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("updateTicker", get_cmp_today))
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     app.add_handler(CommandHandler("portfolioAlerts", portfolio_alerts))
+    app.add_handler(CommandHandler("rebalanceRecommendations", rebalance_recommendations))
+    app.add_handler(CommandHandler("setAlert", set_alert))
+    app.add_handler(CommandHandler("listAlerts", list_alerts))
+    app.add_handler(CallbackQueryHandler(price_alert_callback, pattern=r"^pal_"))
     print("🤖 Bot is running...")
     logger.info("🤖 Bot is running...")
     app.run_polling()

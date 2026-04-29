@@ -294,14 +294,14 @@ class PortfolioManager:
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
 
-        grand_invested = grand_current = 0.0
+        grand_invested = grand_current = grand_real_pl = 0.0
 
         for portfolio_name in sorted(portfolios):
             pd = portfolios[portfolio_name]
             lines.append("")
             lines.append(f"💼 *{portfolio_name}*")
 
-            port_invested = port_current = 0.0
+            port_invested = port_current = port_real_pl = 0.0
 
             inr_open   = [t for t in pd["open"]   if t["currency"] == "INR"]
             inr_closed = [t for t in pd["closed"] if t["currency"] == "INR"]
@@ -311,40 +311,51 @@ class PortfolioManager:
             if inr_open or inr_closed:
                 lines.append("🇮🇳 *Indian Stocks*")
                 lines.extend(build_section(inr_open, inr_closed))
-                inr_inv = sum(t["invested_inr"] for t in inr_open) + sum(t["buy_cost_inr"] for t in inr_closed)
-                inr_cur = sum(t["current_inr"]  for t in inr_open) + sum(t["sell_inr"]     for t in inr_closed)
-                inr_pl  = inr_cur - inr_inv
-                port_invested += inr_inv; port_current += inr_cur
-                grand_invested += inr_inv; grand_current += inr_cur
-                lines.append(f"   🏦 Indian Subtotal: {fmt_inr(inr_inv)} → {fmt_inr(inr_cur)}  {pl_emoji(inr_pl)} {fmt_inr(inr_pl)}")
+                inr_inv      = sum(t["invested_inr"] for t in inr_open)
+                inr_cur      = sum(t["current_inr"]  for t in inr_open)
+                inr_real_pl  = sum(t["realised_pl"]  for t in inr_open) + sum(t["realised_pl"] for t in inr_closed)
+                inr_unreal   = inr_cur - inr_inv
+                inr_pl       = inr_unreal + inr_real_pl
+                port_invested += inr_inv; port_current += inr_cur; port_real_pl += inr_real_pl
+                grand_invested += inr_inv; grand_current += inr_cur; grand_real_pl += inr_real_pl
+                lines.append(f"   🏦 Indian Subtotal: Deployed {fmt_inr(inr_inv)} → {fmt_inr(inr_cur)}  {pl_emoji(inr_pl)} P&L {fmt_inr(inr_pl)} (Realised: {fmt_inr(inr_real_pl)} | Unrealised: {fmt_inr(inr_unreal)})")
 
             if usd_open or usd_closed:
                 lines.append("🇺🇸 *US Stocks (cost in ₹, CMP converted from USD)*")
                 lines.extend(build_section(usd_open, usd_closed))
-                usd_inv = sum(t["invested_inr"] for t in usd_open) + sum(t["buy_cost_inr"] for t in usd_closed)
-                usd_cur = sum(t["current_inr"]  for t in usd_open) + sum(t["sell_inr"]     for t in usd_closed)
-                usd_pl  = usd_cur - usd_inv
-                port_invested += usd_inv; port_current += usd_cur
-                grand_invested += usd_inv; grand_current += usd_cur
-                lines.append(f"   🏦 US Subtotal: {fmt_inr(usd_inv)} → {fmt_inr(usd_cur)}  {pl_emoji(usd_pl)} {fmt_inr(usd_pl)}")
+                usd_inv      = sum(t["invested_inr"] for t in usd_open)
+                usd_cur      = sum(t["current_inr"]  for t in usd_open)
+                usd_real_pl  = sum(t["realised_pl"]  for t in usd_open) + sum(t["realised_pl"] for t in usd_closed)
+                usd_unreal   = usd_cur - usd_inv
+                usd_pl       = usd_unreal + usd_real_pl
+                port_invested += usd_inv; port_current += usd_cur; port_real_pl += usd_real_pl
+                grand_invested += usd_inv; grand_current += usd_cur; grand_real_pl += usd_real_pl
+                lines.append(f"   🏦 US Subtotal: Deployed {fmt_inr(usd_inv)} → {fmt_inr(usd_cur)}  {pl_emoji(usd_pl)} P&L {fmt_inr(usd_pl)} (Realised: {fmt_inr(usd_real_pl)} | Unrealised: {fmt_inr(usd_unreal)})")
 
-            port_pl = port_current - port_invested
+            port_unreal = port_current - port_invested
+            port_pl     = port_unreal + port_real_pl
             lines.append("─────────────────────────────")
             lines.append(
-                f"📌 *{portfolio_name} Total*: {fmt_inr(port_invested)} → {fmt_inr(port_current)}  "
-                f"{pl_emoji(port_pl)} {fmt_inr(port_pl)} "
-                f"({(port_pl / port_invested * 100) if port_invested else 0:+.2f}%)"
+                f"📌 *{portfolio_name} Total*\n"
+                f"   Currently Deployed: {fmt_inr(port_invested)} → {fmt_inr(port_current)}\n"
+                f"   {pl_emoji(port_unreal)} Unrealised P&L: {fmt_inr(port_unreal)}"
+                + (f"\n   {pl_emoji(port_real_pl)} Realised P&L:   {fmt_inr(port_real_pl)}" if port_real_pl else "")
+                + f"\n   {pl_emoji(port_pl)} Total P&L:      {fmt_inr(port_pl)} "
+                f"({(port_pl / (port_invested + port_real_pl) * 100) if (port_invested + port_real_pl) else 0:+.2f}%)"
             )
 
-        grand_pl = grand_current - grand_invested
+        grand_unreal = grand_current - grand_invested
+        grand_pl     = grand_unreal + grand_real_pl
         lines += [
             "",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             f"💼 *Grand Total (INR equivalent)*\n"
-            f"   Total Invested: {fmt_inr(grand_invested)}\n"
-            f"   Total Value:    {fmt_inr(grand_current)}\n"
-            f"   {pl_emoji(grand_pl)} Overall P&L: {fmt_inr(grand_pl)} "
-            f"({(grand_pl / grand_invested * 100) if grand_invested else 0:+.2f}%)",
+            f"   Currently Deployed: {fmt_inr(grand_invested)}\n"
+            f"   Current Value:      {fmt_inr(grand_current)}\n"
+            f"   {pl_emoji(grand_unreal)} Unrealised P&L: {fmt_inr(grand_unreal)}\n"
+            f"   {pl_emoji(grand_real_pl)} Realised P&L:   {fmt_inr(grand_real_pl)}\n"
+            f"   {pl_emoji(grand_pl)} Total P&L:      {fmt_inr(grand_pl)} "
+            f"({(grand_pl / (grand_invested + grand_real_pl) * 100) if (grand_invested + grand_real_pl) else 0:+.2f}%)",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
 
