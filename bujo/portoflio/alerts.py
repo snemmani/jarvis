@@ -35,7 +35,7 @@ def _compute_open_positions(transactions: List[Dict]) -> Dict[str, Dict]:
         cmp = float(tx.get("CMP") or 0)
         date_str = (tx.get("Date") or "")[:10]
 
-        if not ticker or shares == 0:
+        if not ticker or ticker.upper() == "CASH" or shares == 0:
             continue
 
         if ticker not in data:

@@ -14,3 +14,4 @@ yfinance
 matplotlib
 debugpy
 google-search-results
+beautifulsoup4

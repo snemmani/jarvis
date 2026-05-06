@@ -48,15 +48,13 @@ from bujo.base import (
     TEXT_TO_SPEECH_MODEL,
     portfolio_transactions_model,
     price_alerts_model,
-    NOIP_USERNAME,
-    NOIP_PASSWORD,
-    NOIP_HOSTNAME,
+    RELAY_BASE_URL,
 )
 from bujo.expenses.manage import ExpenseManager
 from bujo.mag.manage import MagManager
 from bujo.portoflio.manage import PortfolioManager
 from bujo.portoflio.alerts import run_portfolio_alerts
-from bujo.portoflio.rebalance import run_rebalance_analysis
+from bujo.portoflio.rebalance import run_rebalance_analysis, run_fresh_portfolio_analysis
 from bujo.analytics.charts import spending_pie_chart, spending_bar_chart
 from langchain_openai import ChatOpenAI
 import requests
@@ -68,7 +66,7 @@ SYSTEM_PROMPT = [
     "You have access to the following tools, and depending on my request, you will call the appropriate tool:",
     "1. Expenses Tool – If I talk about expenses, use this tool to add or list my expenses.",
     "2. MAG Tool – If I talk about MAG (my calendar/events), use this tool to add or list my MAG.",
-    "3. Portfolio_Tool – If I talk about portfolio transactions (buying or selling stocks/shares, recording a trade, listing my portfolio transactions), use this tool.",
+    "3. Portfolio_Tool – If I talk about portfolio transactions (buying or selling stocks/shares, recording a trade, listing my portfolio transactions, depositing or withdrawing cash from a portfolio), use this tool.",
     "4. Wolfram_Alpha_Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
     "5. Translation_Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
     "6. Expense_Analytics_Tool – If I ask for expense charts, spending breakdown, category analysis, daily trend, or any analytics/visualisation, use this tool. Pass a JSON string with 'start_date' (YYYY-MM-DD), 'end_date' (YYYY-MM-DD, exclusive upper bound), and 'chart_type' ('pie' for category breakdown, 'bar' for daily trend). Example: {\"start_date\": \"2025-04-01\", \"end_date\": \"2025-05-01\", \"chart_type\": \"pie\"}.",
@@ -149,7 +147,7 @@ _static_tools = [
     Tool(
         name="Portfolio_Tool",
         func=portfolio_manager.agent_portfolio,
-        description="Use this tool to record or list portfolio transactions (buy/sell stocks).",
+        description="Use this tool to record or list portfolio transactions (buy/sell stocks, deposit/withdraw cash).",
         return_direct=True,
     ),
     Tool(
@@ -362,35 +360,18 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(file_name)
 
 
-def _mangle_ipv6(ip: str) -> str:
-    last = ip[-1]
-    mangled = format((int(last, 16) + 3) % 16, "x")
-    return ip[:-1] + mangled
-
-
-def _noip_set(ip: str) -> tuple[str, str]:
-    resp = requests.get(
-        "https://dynupdate.no-ip.com/nic/update",
-        params={"hostname": NOIP_HOSTNAME, "myip": ip},
-        auth=(NOIP_USERNAME, NOIP_PASSWORD),
-        headers={"User-Agent": "JARVISBot/1.0 " + NOIP_USERNAME},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return ip, resp.text.strip()
-
-
 @check_authorization
 async def ddns(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     subcommand = (_context.args[0].lower() if _context.args else "")
     logger.info("ddns %s from user %s", subcommand, update.effective_user.id)
 
     if subcommand == "update":
-        def _do_update() -> tuple[str, str]:
-            ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
-            return _noip_set(ip)
         try:
-            ip, status = await asyncio.to_thread(_do_update)
+            resp = await asyncio.to_thread(
+                requests.get, f"{RELAY_BASE_URL}/ddns/update", timeout=15
+            )
+            resp.raise_for_status()
+            ip, status = resp.text.strip().split(" ", 1)
             if status.startswith(("good", "nochg")):
                 await update.message.reply_text(
                     f"✅ DDNS updated.\nIP: `{ip}`\nStatus: `{status}`",
@@ -403,14 +384,15 @@ async def ddns(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ DDNS update failed.")
 
     elif subcommand == "block":
-        def _do_block() -> tuple[str, str]:
-            real_ip = requests.get("http://ip1.dynupdate6.no-ip.com/", timeout=10).text.strip()
-            return _noip_set(_mangle_ipv6(real_ip))
         try:
-            ip, status = await asyncio.to_thread(_do_block)
+            resp = await asyncio.to_thread(
+                requests.get, f"{RELAY_BASE_URL}/ddns/block", timeout=15
+            )
+            resp.raise_for_status()
+            ip, status = resp.text.strip().split(" ", 1)
             if status.startswith(("good", "nochg")):
                 await update.message.reply_text(
-                    f"🔒 DDNS blocked.\nHostname `{NOIP_HOSTNAME}` now points to `{ip}`.\nStatus: `{status}`",
+                    f"🔒 DDNS blocked.\nHostname now points to `{ip}`.\nStatus: `{status}`",
                     parse_mode="markdown",
                 )
             else:
@@ -619,6 +601,48 @@ async def rebalance_recommendations(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"❌ Error running rebalance analysis: {e}")
 
 
+@check_authorization
+async def build_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("buildPortfolio from user %s", update.effective_user.id)
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /buildPortfolio <amount>\nExample: /buildPortfolio 500000"
+        )
+        return
+    try:
+        amount = float(args[0].replace(",", "").replace("₹", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Example: /buildPortfolio 500000")
+        return
+
+    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+    await update.message.reply_text(
+        f"⏳ Screening NSE large & upper mid-cap stocks and building a ₹{amount:,.0f} portfolio… this may take a couple of minutes."
+    )
+    try:
+        report_path, input_path, usage_msg = await asyncio.to_thread(
+            run_fresh_portfolio_analysis, amount
+        )
+        for path, caption in [
+            (input_path,  "📋 Input prompt — screened candidates + fundamentals for fact-checking"),
+            (report_path, "📄 Fresh portfolio report — open in any Markdown viewer"),
+        ]:
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=os.path.basename(path),
+                        caption=caption,
+                    )
+                os.remove(path)
+        await update.message.reply_text(usage_msg)
+    except Exception as e:
+        logger.error("Error in buildPortfolio: %s", e, exc_info=True)
+        await update.message.reply_text(f"❌ Error building portfolio: {e}")
+
+
 async def setup_scheduler(application):
     async def scheduled_update_cmp():
         try:
@@ -639,6 +663,7 @@ async def setup_scheduler(application):
 
     async def scheduled_portfolio_alerts():
         try:
+            await asyncio.to_thread(portfolio_manager.update_cmp)
             msg = await asyncio.to_thread(run_portfolio_alerts, portfolio_transactions_model)
             if msg:
                 await application.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="markdown")
@@ -746,6 +771,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     app.add_handler(CommandHandler("portfolioAlerts", portfolio_alerts))
     app.add_handler(CommandHandler("rebalanceRecommendations", rebalance_recommendations))
+    app.add_handler(CommandHandler("buildPortfolio", build_portfolio))
     app.add_handler(CommandHandler("setAlert", set_alert))
     app.add_handler(CommandHandler("listAlerts", list_alerts))
     app.add_handler(CallbackQueryHandler(price_alert_callback, pattern=r"^pal_"))

@@ -33,6 +33,13 @@ SYSTEM_PROMPT = [
     "• Call `Transaction_Creation` with the JSON string.",
     "• On success respond: '✅ Transaction recorded: [Buy/Sell] NoOfShares shares of Ticker at ₹CostPerShare on Date'.",
 
+    "Use Case 1b: When the user wants to **record a cash deposit or withdrawal** (adding/removing funds from a portfolio), follow these instructions:",
+    "• This is for tracking idle cash available for deployment — NOT for recording stock trades.",
+    "• Examples: 'deposited 50000 into my LT portfolio', 'added ₹1 lakh cash to Default', 'withdrew 20000 from ST portfolio'.",
+    "• Record as: {\"Ticker\": \"CASH\", \"TransactionType\": \"Deposit\" (or \"Withdrawal\"), \"NoOfShares\": 1, \"CostPerShare\": <amount>, \"Date\": \"<YYYY-MM-DD>\", \"Portfolio\": \"<portfolio>\"}",
+    "• 'deposit'/'add cash'/'fund' → TransactionType = 'Deposit'. 'withdraw'/'remove cash'/'take out' → TransactionType = 'Withdrawal'.",
+    "• On success respond: '✅ Cash recorded: [Deposit/Withdrawal] of ₹<amount> in <portfolio> portfolio on <date>'.",
+
     "Use Case 2: When the user wants to **list/view transactions**, follow these instructions:",
     "• Always send tool inputs as **JSON strings**.",
     "• Supported filters (NocoDB syntax): date range, ticker, transaction type.",
@@ -124,7 +131,10 @@ class PortfolioManager:
     def update_cmp(self) -> str:
         """Fetch latest prices from yfinance and update all transaction rows in NocoDB."""
         transactions = self.transactions_model.list()
-        tickers = {tx.get("Ticker") for tx in transactions if tx.get("Ticker")}
+        tickers = {
+            tx.get("Ticker") for tx in transactions
+            if tx.get("Ticker") and tx.get("Ticker", "").upper() != "CASH"
+        }
         if not tickers:
             return "No tickers found in transactions table."
         for ticker in tickers:
@@ -162,7 +172,7 @@ class PortfolioManager:
             cmp       = float(tx.get("CMP") or 0)
             portfolio = tx.get("Portfolio", "Unknown").strip()
 
-            if not ticker or shares == 0:
+            if not ticker or ticker.upper() == "CASH" or shares == 0:
                 continue
 
             is_inr   = ticker.upper().endswith(".NS")
