@@ -33,8 +33,8 @@ SYSTEM_PROMPT = [
     "• Call `Transaction_Creation` with the JSON string.",
     "• On success respond: '✅ Transaction recorded: [Buy/Sell] NoOfShares shares of Ticker at ₹CostPerShare on Date'.",
 
-    "Use Case 1b: When the user wants to **record a cash deposit or withdrawal** (adding/removing funds from a portfolio), follow these instructions:",
-    "• This is for tracking idle cash available for deployment — NOT for recording stock trades.",
+    "Use Case 1b: When the user wants to **record a cash deposit or withdrawal** (adding/removing external funds from a portfolio), follow these instructions:",
+    "• This is for external cash flows only — fresh capital added or withdrawn from the portfolio. NOT for recording stock trades (buy/sell automatically updates cash).",
     "• Examples: 'deposited 50000 into my LT portfolio', 'added ₹1 lakh cash to Default', 'withdrew 20000 from ST portfolio'.",
     "• Record as: {\"Ticker\": \"CASH\", \"TransactionType\": \"Deposit\" (or \"Withdrawal\"), \"NoOfShares\": 1, \"CostPerShare\": <amount>, \"Date\": \"<YYYY-MM-DD>\", \"Portfolio\": \"<portfolio>\"}",
     "• 'deposit'/'add cash'/'fund' → TransactionType = 'Deposit'. 'withdraw'/'remove cash'/'take out' → TransactionType = 'Withdrawal'.",
@@ -118,11 +118,37 @@ class PortfolioManager:
         logger.info("Adding transaction with data: %s", data)
         try:
             data_object = json.loads(data)
+            ticker   = (data_object.get("Ticker") or "").strip().upper()
+            tx_type  = (data_object.get("TransactionType") or "").strip()
+
             response_add = self.transactions_model.create(data_object)
             logger.info("Transaction creation response: %s", response_add)
             if "failed" in str(response_add).lower():
                 logger.warning("Failed to add transaction entry.")
                 return "Failed to add transaction entry. Try again?"
+
+            # Auto-create offsetting CASH entry for Buy/Sell (full proceeds, no brokerage)
+            if ticker != "CASH" and tx_type in ("Buy", "Sell"):
+                shares    = float(data_object.get("NoOfShares") or 0)
+                cost      = float(data_object.get("CostPerShare") or 0)
+                amount    = shares * cost
+                portfolio = (data_object.get("Portfolio") or "Default").strip()
+                date_str  = data_object.get("Date", "")
+                cash_type = "Withdrawal" if tx_type == "Buy" else "Deposit"
+                cash_entry = {
+                    "Ticker":          "CASH",
+                    "TransactionType": cash_type,
+                    "NoOfShares":      1,
+                    "CostPerShare":    amount,
+                    "Date":            date_str,
+                    "Portfolio":       portfolio,
+                }
+                cash_resp = self.transactions_model.create(cash_entry)
+                logger.info("Auto-cash entry (%s ₹%.0f) response: %s", cash_type, amount, cash_resp)
+                if "failed" in str(cash_resp).lower():
+                    logger.warning("Stock transaction saved but auto-cash entry failed.")
+                    return "Transaction added successfully (⚠️ cash balance update failed — record manually)"
+
             return "Transaction added successfully"
         except Exception as e:
             logger.error("Error in add_transaction: %s", e, exc_info=True)

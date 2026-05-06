@@ -21,6 +21,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -126,8 +127,13 @@ wolfram_client = wolframalpha.Client(WOLFRAM_APP_ID)
 # Persistent memory for the outer agent; survives agent reconstruction each message.
 _main_memory = MemorySaver()
 
-# alert_id -> datetime until which the alert is snoozed
-_alert_snooze: dict[int, datetime] = {}
+# user_id -> alert_id awaiting a new target price (modify flow)
+_alert_modify_pending: dict[int, int] = {}
+
+# ── Build Portfolio conversation states ──
+BP_AMOUNT, BP_RISK, BP_HORIZON, BP_SECTOR_FOCUS, BP_SECTOR_AVOID, BP_STOCK_COUNT, BP_CONFIRM = range(7)
+
+_BP_SECTORS = ["IT / Tech", "Banking / Finance", "Pharma", "FMCG / Consumer", "Manufacturing", "Energy"]
 
 
 # Static tools (no Telegram context needed)
@@ -259,7 +265,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @check_authorization
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await agent_engage(update, context, update.message.text.strip())
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # Intercept pending alert modify flow
+    if user_id in _alert_modify_pending:
+        alert_id = _alert_modify_pending.pop(user_id)
+        try:
+            new_price = float(text.replace(",", "").replace("₹", "").strip())
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price. Send just a number, e.g. `1250.50`.")
+            _alert_modify_pending[user_id] = alert_id  # put it back
+            return
+        ok = price_alerts_model.update(alert_id, TargetPrice=new_price)
+        if ok:
+            await update.message.reply_text(f"✅ Alert updated — new target ₹{new_price:,.2f}")
+        else:
+            await update.message.reply_text("❌ Failed to update alert.")
+        return
+
+    await agent_engage(update, context, text)
 
 
 async def agent_engage(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -524,8 +549,9 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = (alert.get("Action") or "").strip()
         action_line = f"\n📝 _{action}_" if action else ""
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💤 Snooze 2h", callback_data=f"pal_snooze_{alert_id}"),
+            InlineKeyboardButton("✏️ Modify", callback_data=f"pal_modify_{alert_id}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"pal_cancel_{alert_id}"),
+            InlineKeyboardButton("✅ Done", callback_data=f"pal_done_{alert_id}"),
         ]])
         await update.message.reply_text(
             f"🔔 *{ticker}* — {direction} ₹{target:,.2f}{action_line}",
@@ -539,20 +565,31 @@ async def price_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     data = query.data
 
-    if data.startswith("pal_snooze_"):
+    async def _try_delete():
+        try:
+            await query.message.delete()
+        except Exception:
+            pass  # message too old to delete — ignore
+
+    if data.startswith("pal_done_"):
+        await _try_delete()
+
+    elif data.startswith("pal_modify_"):
         alert_id = int(data.split("_")[-1])
-        _alert_snooze[alert_id] = datetime.now() + timedelta(hours=2)
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"💤 Alert snoozed for 2 hours.")
+        user_id = query.from_user.id
+        _alert_modify_pending[user_id] = alert_id
+        await _try_delete()
+        await query.message.reply_text(
+            "✏️ Send the new target price (just a number, e.g. `1250.50`):",
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("pal_cancel_"):
         alert_id = int(data.split("_")[-1])
         ok = price_alerts_model.deactivate(alert_id)
-        _alert_snooze.pop(alert_id, None)
-        await query.edit_message_reply_markup(reply_markup=None)
-        if ok:
-            await query.message.reply_text("🗑️ Alert cancelled.")
-        else:
+        _alert_modify_pending.pop(query.from_user.id, None)
+        await _try_delete()
+        if not ok:
             await query.message.reply_text("❌ Failed to cancel alert.")
 
 
@@ -602,45 +639,211 @@ async def rebalance_recommendations(update: Update, context: ContextTypes.DEFAUL
 
 
 @check_authorization
-async def build_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("buildPortfolio from user %s", update.effective_user.id)
+async def bp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for /buildPortfolio conversation."""
+    logger.info("buildPortfolio started by user %s", update.effective_user.id)
+    context.user_data.clear()
+    # If amount supplied inline, skip directly to risk question
     args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Usage: /buildPortfolio <amount>\nExample: /buildPortfolio 500000"
-        )
-        return
-    try:
-        amount = float(args[0].replace(",", "").replace("₹", ""))
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount. Example: /buildPortfolio 500000")
-        return
-
-    await update.message.reply_chat_action(telegram.constants.ChatAction.TYPING)
+    if args:
+        try:
+            amount = float(args[0].replace(",", "").replace("₹", ""))
+            context.user_data["bp_amount"] = amount
+            return await _bp_ask_risk(update, context)
+        except ValueError:
+            pass
     await update.message.reply_text(
-        f"⏳ Screening NSE large & upper mid-cap stocks and building a ₹{amount:,.0f} portfolio… this may take a couple of minutes."
+        "💼 *Build a Fresh Portfolio*\n\nStep 1/6 — How much do you want to invest?\n"
+        "Send the amount in ₹ (e.g. `500000` or `5,00,000`)",
+        parse_mode="Markdown",
+    )
+    return BP_AMOUNT
+
+
+async def bp_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    text = update.message.text.strip().replace(",", "").replace("₹", "")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Please send a valid positive number, e.g. `500000`.")
+        return BP_AMOUNT
+    context.user_data["bp_amount"] = amount
+    return await _bp_ask_risk(update, context)
+
+
+async def _bp_ask_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛡️ Conservative", callback_data="bp_risk_Conservative"),
+        InlineKeyboardButton("⚖️ Moderate",     callback_data="bp_risk_Moderate"),
+        InlineKeyboardButton("🚀 Aggressive",   callback_data="bp_risk_Aggressive"),
+    ]])
+    amount = context.user_data["bp_amount"]
+    msg = f"✅ Amount: ₹{amount:,.0f}\n\nStep 2/6 — What's your risk appetite?"
+    if update.callback_query:
+        await update.callback_query.message.reply_text(msg, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard)
+    return BP_RISK
+
+
+async def bp_got_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bp_risk"] = query.data.split("_", 2)[-1]
+    await query.message.delete()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📅 Short  <2yr",   callback_data="bp_horizon_<2 years"),
+        InlineKeyboardButton("📆 Medium 2–5yr", callback_data="bp_horizon_2–5 years"),
+        InlineKeyboardButton("🗓️ Long  >5yr",   callback_data="bp_horizon_Long >5yr"),
+    ]])
+    await query.message.reply_text(
+        f"✅ Risk: {context.user_data['bp_risk']}\n\nStep 3/6 — Investment horizon?",
+        reply_markup=keyboard,
+    )
+    return BP_HORIZON
+
+
+async def bp_got_horizon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bp_horizon"] = query.data.split("_", 2)[-1]
+    await query.message.delete()
+    buttons = [[InlineKeyboardButton("🌐 All sectors", callback_data="bp_focus_All sectors")]]
+    buttons += [[InlineKeyboardButton(s, callback_data=f"bp_focus_{s}")] for s in _BP_SECTORS]
+    await query.message.reply_text(
+        f"✅ Horizon: {context.user_data['bp_horizon']}\n\nStep 4/6 — Any sector you want to *focus* on?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return BP_SECTOR_FOCUS
+
+
+async def bp_got_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bp_focus"] = query.data.split("_", 2)[-1]
+    await query.message.delete()
+    buttons = [[InlineKeyboardButton("🚫 None", callback_data="bp_avoid_None")]]
+    buttons += [[InlineKeyboardButton(s, callback_data=f"bp_avoid_{s}")] for s in _BP_SECTORS]
+    await query.message.reply_text(
+        f"✅ Focus: {context.user_data['bp_focus']}\n\nStep 5/6 — Any sector to *avoid*?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return BP_SECTOR_AVOID
+
+
+async def bp_got_avoid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bp_avoid"] = query.data.split("_", 2)[-1]
+    await query.message.delete()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("5–8 (concentrated)",  callback_data="bp_count_5–8 (concentrated)"),
+        InlineKeyboardButton("8–12 (balanced)",     callback_data="bp_count_8–12 (balanced)"),
+    ], [
+        InlineKeyboardButton("12–15 (diversified)", callback_data="bp_count_12–15 (diversified)"),
+        InlineKeyboardButton("🤖 Auto",             callback_data="bp_count_Auto"),
+    ]])
+    await query.message.reply_text(
+        f"✅ Avoid: {context.user_data['bp_avoid']}\n\nStep 6/6 — How many stocks?",
+        reply_markup=keyboard,
+    )
+    return BP_STOCK_COUNT
+
+
+async def bp_got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bp_count"] = query.data.split("_", 2)[-1]
+    await query.message.delete()
+    d = context.user_data
+    summary = (
+        f"📋 *Portfolio Build Summary*\n\n"
+        f"💰 Amount:  ₹{d['bp_amount']:,.0f}\n"
+        f"⚖️ Risk:    {d['bp_risk']}\n"
+        f"🗓️ Horizon: {d['bp_horizon']}\n"
+        f"🎯 Focus:   {d['bp_focus']}\n"
+        f"🚫 Avoid:   {d['bp_avoid']}\n"
+        f"📊 Stocks:  {d['bp_count']}\n\n"
+        "Shall I build this portfolio? (takes ~2–3 minutes)"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Build it", callback_data="bp_confirm_yes"),
+        InlineKeyboardButton("❌ Cancel",   callback_data="bp_confirm_no"),
+    ]])
+    await query.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
+    return BP_CONFIRM
+
+
+async def bp_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != AUTHORIZED_USER_ID:
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    await query.message.delete()
+    if query.data == "bp_confirm_no":
+        await query.message.reply_text("❌ Portfolio build cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    d = context.user_data
+    amount = d["bp_amount"]
+    preferences = {
+        "risk_appetite":  d.get("bp_risk", "Moderate"),
+        "horizon":        d.get("bp_horizon", "Long >5yr"),
+        "sector_focus":   d.get("bp_focus", "All sectors"),
+        "sector_avoid":   d.get("bp_avoid", "None"),
+        "stock_count":    d.get("bp_count", "Auto"),
+    }
+    context.user_data.clear()
+
+    await query.message.reply_text(
+        f"⏳ Screening NSE large & upper mid-cap stocks and building your ₹{amount:,.0f} portfolio…\n"
+        "This may take 2–3 minutes.",
     )
     try:
         report_path, input_path, usage_msg = await asyncio.to_thread(
-            run_fresh_portfolio_analysis, amount
+            run_fresh_portfolio_analysis, amount, preferences
         )
         for path, caption in [
-            (input_path,  "📋 Input prompt — screened candidates + fundamentals for fact-checking"),
+            (input_path,  "📋 Input prompt — screened candidates + fundamentals"),
             (report_path, "📄 Fresh portfolio report — open in any Markdown viewer"),
         ]:
             if path and os.path.exists(path):
                 with open(path, "rb") as f:
                     await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
+                        chat_id=query.message.chat_id,
                         document=f,
                         filename=os.path.basename(path),
                         caption=caption,
                     )
                 os.remove(path)
-        await update.message.reply_text(usage_msg)
+        await query.message.reply_text(usage_msg)
     except Exception as e:
         logger.error("Error in buildPortfolio: %s", e, exc_info=True)
-        await update.message.reply_text(f"❌ Error building portfolio: {e}")
+        await query.message.reply_text(f"❌ Error building portfolio: {e}")
+    return ConversationHandler.END
+
+
+async def bp_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Portfolio build cancelled.")
+    return ConversationHandler.END
 
 
 async def setup_scheduler(application):
@@ -685,9 +888,6 @@ async def setup_scheduler(application):
                 direction = alert.get("Direction", "")
                 target = float(alert.get("TargetPrice") or 0)
 
-                # Skip if snoozed
-                if alert_id in _alert_snooze and now < _alert_snooze[alert_id]:
-                    continue
 
                 cmp = yf.Ticker(ticker).info.get("currentPrice") or 0
                 if not cmp:
@@ -702,10 +902,6 @@ async def setup_scheduler(application):
                     continue
 
                 arrow = "📈" if cmp >= target else "📉"
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("💤 Snooze 2h", callback_data=f"pal_snooze_{alert_id}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"pal_cancel_{alert_id}"),
-                ]])
                 action = (alert.get("Action") or "").strip()
                 action_line = f"\n📝 _{action}_" if action else ""
                 await application.bot.send_message(
@@ -714,9 +910,9 @@ async def setup_scheduler(application):
                         f"🔔 *Price Alert — {ticker}*\n"
                         f"{arrow} CMP ₹{cmp:,.2f} is {direction} target ₹{target:,.2f}"
                         f"{action_line}"
+                        f"\n\nUse /listAlerts to modify or cancel."
                     ),
                     parse_mode="Markdown",
-                    reply_markup=keyboard,
                 )
         except Exception as e:
             logger.error("Error in scheduled price alerts: %s", e)
@@ -771,7 +967,20 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("getProfitLoss", get_profit_loss))
     app.add_handler(CommandHandler("portfolioAlerts", portfolio_alerts))
     app.add_handler(CommandHandler("rebalanceRecommendations", rebalance_recommendations))
-    app.add_handler(CommandHandler("buildPortfolio", build_portfolio))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("buildPortfolio", bp_start)],
+        states={
+            BP_AMOUNT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, bp_got_amount)],
+            BP_RISK:         [CallbackQueryHandler(bp_got_risk,    pattern=r"^bp_risk_")],
+            BP_HORIZON:      [CallbackQueryHandler(bp_got_horizon, pattern=r"^bp_horizon_")],
+            BP_SECTOR_FOCUS: [CallbackQueryHandler(bp_got_focus,   pattern=r"^bp_focus_")],
+            BP_SECTOR_AVOID: [CallbackQueryHandler(bp_got_avoid,   pattern=r"^bp_avoid_")],
+            BP_STOCK_COUNT:  [CallbackQueryHandler(bp_got_count,   pattern=r"^bp_count_")],
+            BP_CONFIRM:      [CallbackQueryHandler(bp_confirmed,   pattern=r"^bp_confirm_")],
+        },
+        fallbacks=[CommandHandler("cancel", bp_cancel)],
+        per_message=False,
+    ))
     app.add_handler(CommandHandler("setAlert", set_alert))
     app.add_handler(CommandHandler("listAlerts", list_alerts))
     app.add_handler(CallbackQueryHandler(price_alert_callback, pattern=r"^pal_"))

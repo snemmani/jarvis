@@ -22,6 +22,16 @@ class PriceAlerts(BaseNocoDB):
         rows = self._paginated_list({})
         return [r for r in rows if r.get("Active")]
 
+    def update(self, alert_id: int, **fields) -> bool:
+        response = requests.patch(
+            self._url(f"/{alert_id}"),
+            json=fields,
+            headers=self.headers,
+        )
+        if not response.ok:
+            logger.error("PriceAlerts update failed: %s %s", response.status_code, response.text)
+        return response.ok
+
     def deactivate(self, alert_id: int) -> bool:
         response = requests.patch(
             self._url(f"/{alert_id}"),

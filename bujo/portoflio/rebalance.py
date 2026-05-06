@@ -349,6 +349,34 @@ def _cagr(start_val: float, end_val: float, years: float) -> Optional[float]:
     return None
 
 
+# Module-level FX rate cache (refreshed per process run)
+_FX_CACHE: Dict[str, float] = {}
+
+
+def _fetch_fx_rate(from_currency: str) -> float:
+    """Fetch current exchange rate to INR, cached per process."""
+    key = from_currency
+    if key in _FX_CACHE:
+        return _FX_CACHE[key]
+    rate = 1.0
+    try:
+        ticker_sym = f"{from_currency}INR=X"
+        yf_obj = yf.Ticker(ticker_sym)
+        try:
+            rate = float(yf_obj.fast_info.last_price or 0) or None
+        except Exception:
+            rate = None
+        if not rate:
+            info = yf_obj.info or {}
+            rate = info.get("regularMarketPrice") or info.get("currentPrice")
+        rate = float(rate) if rate else 1.0
+    except Exception:
+        rate = 1.0
+    logger.info("FX rate %sINR = %.4f", from_currency, rate)
+    _FX_CACHE[key] = rate
+    return rate
+
+
 def _classify_sector(sector: str, industry: str) -> str:
     """Map yfinance sector to GrahamPrompt valuation framework bucket."""
     s = (sector or "").lower()
@@ -511,6 +539,12 @@ def _fetch_ticker_data(ticker: str) -> Dict:
         industry = info.get("industry", "N/A")
         sector_bucket = _classify_sector(sector, industry)
 
+        # ── Currency detection & FX conversion ──
+        currency = (info.get("currency") or "INR").upper()
+        fx_rate  = _fetch_fx_rate(currency) if currency != "INR" else 1.0
+
+        cmp_native = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+
         # ── Core identity & price ──
         d: Dict = {
             "company_name":    info.get("shortName") or info.get("longName") or ticker,
@@ -518,12 +552,15 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "industry":        industry,
             "sector_bucket":   sector_bucket,
             "exchange":        info.get("exchange", "N/A"),
-            "market_cap_cr":   round((info.get("marketCap") or 0) / 1e7, 2),
-            "cmp":             info.get("currentPrice") or info.get("regularMarketPrice") or 0,
-            "52w_high":        info.get("fiftyTwoWeekHigh"),
-            "52w_low":         info.get("fiftyTwoWeekLow"),
-            "50d_ma":          info.get("fiftyDayAverage"),
-            "200d_ma":         info.get("twoHundredDayAverage"),
+            "currency":        currency,
+            "fx_rate_to_inr":  fx_rate,
+            "cmp_native":      cmp_native,
+            "market_cap_cr":   round((info.get("marketCap") or 0) * fx_rate / 1e7, 2),
+            "cmp":             round(cmp_native * fx_rate, 4) if cmp_native else 0,
+            "52w_high":        (info.get("fiftyTwoWeekHigh") or 0) * fx_rate or None,
+            "52w_low":         (info.get("fiftyTwoWeekLow") or 0) * fx_rate or None,
+            "50d_ma":          (info.get("fiftyDayAverage") or 0) * fx_rate or None,
+            "200d_ma":         (info.get("twoHundredDayAverage") or 0) * fx_rate or None,
             "beta":            info.get("beta"),
             "avg_volume":      info.get("averageVolume"),
         }
@@ -537,9 +574,9 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "ev_ebitda":     info.get("enterpriseToEbitda"),
             "ev_revenue":    info.get("enterpriseToRevenue"),
             "peg":           info.get("pegRatio"),
-            "book_value":    info.get("bookValue"),
-            "eps_ttm":       info.get("trailingEps"),
-            "eps_forward":   info.get("forwardEps"),
+            "book_value":    round((info.get("bookValue") or 0) * fx_rate, 4) or None,
+            "eps_ttm":       round((info.get("trailingEps") or 0) * fx_rate, 4) or None,
+            "eps_forward":   round((info.get("forwardEps") or 0) * fx_rate, 4) or None,
         })
 
         # ── Profitability & quality (Part E + Part F) ──
@@ -561,7 +598,7 @@ def _fetch_ticker_data(ticker: str) -> Dict:
         # ── Dividend (Part A, value anchor / income role) ──
         d.update({
             "dividend_yield":  _pct(info.get("dividendYield")),
-            "dividend_rate":   info.get("dividendRate"),
+            "dividend_rate":   round((info.get("dividendRate") or 0) * fx_rate, 4) or None,
             "payout_ratio":    _pct(info.get("payoutRatio")),
         })
 
@@ -574,10 +611,10 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "debt_to_equity":    info.get("debtToEquity"),
             "current_ratio":     info.get("currentRatio"),
             "quick_ratio":       info.get("quickRatio"),
-            "total_debt_cr":     round(total_debt / 1e7, 2),
-            "cash_cr":           round(total_cash / 1e7, 2),
-            "net_debt_cr":       round((total_debt - total_cash) / 1e7, 2),
-            "total_revenue_cr":  round(total_revenue / 1e7, 2),
+            "total_debt_cr":     round(total_debt * fx_rate / 1e7, 2),
+            "cash_cr":           round(total_cash * fx_rate / 1e7, 2),
+            "net_debt_cr":       round((total_debt - total_cash) * fx_rate / 1e7, 2),
+            "total_revenue_cr":  round(total_revenue * fx_rate / 1e7, 2),
             "net_debt_to_ebitda": _safe_div(
                 total_debt - total_cash,
                 info.get("ebitda") or 0,
@@ -588,10 +625,10 @@ def _fetch_ticker_data(ticker: str) -> Dict:
         ocf = info.get("operatingCashflow") or 0
         fcf = info.get("freeCashflow") or 0
         d.update({
-            "operating_cashflow_cr": round(ocf / 1e7, 2),
-            "free_cash_flow_cr":     round(fcf / 1e7, 2),
+            "operating_cashflow_cr": round(ocf * fx_rate / 1e7, 2),
+            "free_cash_flow_cr":     round(fcf * fx_rate / 1e7, 2),
             "fcf_yield_pct":         _pct(_safe_div(fcf, market_cap)),
-            "capex_cr":              round(((ocf - fcf) if ocf and fcf else 0) / 1e7, 2),
+            "capex_cr":              round(((ocf - fcf) if ocf and fcf else 0) * fx_rate / 1e7, 2),
         })
 
         # ── Ownership & governance (Part E) ──
@@ -648,7 +685,7 @@ def _fetch_ticker_data(ticker: str) -> Dict:
                     for label, row in rows.items():
                         try:
                             v = float(row[col])
-                            entry[label.lower().replace(" ", "_")] = round(v / 1e7, 2)
+                            entry[label.lower().replace(" ", "_")] = round(v * fx_rate / 1e7, 2)
                         except Exception:
                             entry[label.lower().replace(" ", "_")] = None
                     annual_fin.append(entry)
@@ -682,7 +719,7 @@ def _fetch_ticker_data(ticker: str) -> Dict:
                     for label, row in bs_rows.items():
                         try:
                             v = float(row[col])
-                            entry[label.lower().replace(" ", "_")] = round(v / 1e7, 2)
+                            entry[label.lower().replace(" ", "_")] = round(v * fx_rate / 1e7, 2)
                         except Exception:
                             entry[label.lower().replace(" ", "_")] = None
                     annual_bs.append(entry)
@@ -705,7 +742,7 @@ def _fetch_ticker_data(ticker: str) -> Dict:
                     for label, row in cf_rows.items():
                         try:
                             v = float(row[col])
-                            entry[label.lower().replace(" ", "_")] = round(v / 1e7, 2)
+                            entry[label.lower().replace(" ", "_")] = round(v * fx_rate / 1e7, 2)
                         except Exception:
                             entry[label.lower().replace(" ", "_")] = None
                     annual_cf.append(entry)
@@ -843,7 +880,10 @@ def _build_positions_table(
             pos["net_shares"] * (ticker_data.get(tk, {}).get("cmp") or 0)
             for tk, pos in tickers.items()
         )
-        port_invested = sum(pos["total_invested"] for pos in tickers.values())
+        port_invested = sum(
+            pos["total_invested"] * ticker_data.get(tk, {}).get("fx_rate_to_inr", 1.0)
+            for tk, pos in tickers.items()
+        )
         cash_balance  = cash_map.get(portfolio, 0.0)
         port_total    = port_current_val + cash_balance  # denominator for all port%
 
@@ -873,11 +913,13 @@ def _build_positions_table(
 
         for rank, (ticker, pos) in enumerate(sorted_tickers, 1):
             td      = ticker_data.get(ticker, {})
-            cmp     = td.get("cmp") or 0
-            avg     = pos["avg_cost"]
+            cmp     = td.get("cmp") or 0           # always INR
+            fx      = td.get("fx_rate_to_inr", 1.0)
+            avg_native = pos["avg_cost"]
+            avg     = avg_native * fx               # avg cost in INR
             net     = pos["net_shares"]
             cur_val = net * cmp
-            inv_val = pos["total_invested"]
+            inv_val = pos["total_invested"] * fx    # INR
             unreal_pct = ((cmp - avg) / avg * 100) if avg > 0 and cmp > 0 else 0.0
             port_pct   = (cur_val / port_total * 100) if port_total > 0 else 0.0
 
@@ -889,9 +931,10 @@ def _build_positions_table(
             ltcg         = _ltcg_status(earliest_buy, today) if earliest_buy else "Unknown"
 
             # XIRR proxy: simple CAGR from weighted-average buy date to today
+            # Compare native-currency avg vs native CMP to strip FX noise
+            cmp_native = td.get("cmp_native") or 0
             xirr_proxy = None
-            if pos["all_buy_lots"] and cmp > 0 and avg > 0:
-                # Weighted average purchase date
+            if pos["all_buy_lots"] and cmp_native > 0 and avg_native > 0:
                 total_cost = sum(s * c for _, s, c in pos["all_buy_lots"])
                 wav_ts = sum(
                     (date.fromisoformat(d) - date(1970, 1, 1)).days * s * c
@@ -900,16 +943,19 @@ def _build_positions_table(
                 wav_date = date(1970, 1, 1) + timedelta(days=wav_ts)
                 years_held = (today - wav_date).days / 365.25
                 if years_held > 0:
-                    xirr_proxy = _cagr(avg, cmp, years_held)
+                    xirr_proxy = _cagr(avg_native, cmp_native, years_held)
 
             flags = td.get("forensic_flags") or []
             flags_str = "; ".join(flags) if flags else "None"
             xirr_str = f"{xirr_proxy:+.1f}%" if xirr_proxy is not None else "N/A"
 
+            currency_label = td.get("currency", "INR")
+            avg_display = f"₹{avg:,.2f}" if currency_label == "INR" else f"{currency_label} {avg_native:,.2f} (₹{avg:,.2f})"
+            cmp_display = f"₹{cmp:,.2f}" if currency_label == "INR" else f"{currency_label} {cmp_native:,.2f} (₹{cmp:,.2f})"
             lines.append(
                 f"| {rank} | {ticker} | {td.get('company_name', ticker)[:20]} | "
                 f"{td.get('sector_bucket', 'N/A')} | {net:.2f} | "
-                f"₹{avg:,.2f} | ₹{cmp:,.2f} | "
+                f"{avg_display} | {cmp_display} | "
                 f"₹{inv_val:,.0f} | ₹{cur_val:,.0f} | "
                 f"{port_pct:.1f}% | {unreal_pct:+.1f}% | {xirr_str} | "
                 f"{holding_days} | {hp_class} | {ltcg} | {flags_str} |"
@@ -943,9 +989,10 @@ def _build_duplicate_exposure_table(
 
     for portfolio, tickers in positions_by_portfolio.items():
         for ticker, pos in tickers.items():
+            fx = ticker_data.get(ticker, {}).get("fx_rate_to_inr", 1.0)
             cross[ticker]["portfolios"].append(portfolio)
             cross[ticker]["total_shares"]   += pos["net_shares"]
-            cross[ticker]["total_invested"] += pos["total_invested"]
+            cross[ticker]["total_invested"] += pos["total_invested"] * fx
 
     dupes = {t: v for t, v in cross.items() if len(v["portfolios"]) > 1}
     if not dupes:
@@ -1085,10 +1132,12 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
             lines.append(f"### {ticker}\n_Data fetch error: {td['error']}_\n")
             continue
 
+        currency = td.get("currency", "INR")
+        fx_note  = f" (native {currency}; monetary figures converted to ₹ at {td.get('fx_rate_to_inr', 1.0):.2f})" if currency != "INR" else ""
         lines.append(f"### {ticker} — {td.get('company_name', ticker)}")
         lines.append(f"**Sector Bucket:** {td.get('sector_bucket')} | "
                      f"**Exchange:** {td.get('exchange')} | "
-                     f"**Industry:** {td.get('industry')}")
+                     f"**Industry:** {td.get('industry')}{fx_note}")
         lines.append(f"**Business:** {td.get('business_summary', 'N/A')}")
         lines.append("")
 
@@ -1414,6 +1463,12 @@ Stocks to Buy | Accumulate on Dips | Trim | Exit | Hold | Recent Purchases to Re
 - Positions approaching LTCG boundary → factor in tax timing in sell recommendations.
 - Every large position (>8% portfolio) must be evaluated more deeply than small positions.
 - Explicitly state XIRR potential bucket for every stock: >20% / 15–20% / 10–15% / <10% / Unclear.
+
+**Cross-portfolio differentiation (mandatory when ≥2 portfolios exist):**
+- Do NOT recommend the same new ENTER in multiple portfolios unless there is a compelling and explicitly stated reason (e.g. the stock is truly exceptional, each portfolio has a completely different mandate, or the combined weight across portfolios is still within concentration limits).
+- For each new ENTER recommendation, assign it to the single portfolio where it fits best — based on that portfolio's existing sector gaps, concentration headroom, and cash availability.
+- If a sector theme (e.g. IT, Banking) is identified as attractive, split the opportunity: recommend different stocks within that theme across portfolios, not the same stock in all. Example: if IT exposure is needed, put TCS in Portfolio A and a different IT name (e.g. Wipro, Zensar, Persistent) in Portfolio B.
+- In Part I (Final Action Table), explicitly flag any ticker that appears as ENTER in more than one portfolio and justify why duplication is warranted despite the added concentration risk.
 """
 
 
@@ -1816,12 +1871,20 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
     return "\n".join(sections), all_quotes
 
 
-def run_fresh_portfolio_analysis(amount: float) -> Tuple[Optional[str], Optional[str], str]:
+def run_fresh_portfolio_analysis(
+    amount: float,
+    preferences: Optional[Dict] = None,
+) -> Tuple[Optional[str], Optional[str], str]:
     """
     Build a fresh portfolio recommendation for the given cash amount.
+    preferences keys: risk_appetite, horizon, sector_focus, sector_avoid, stock_count
     Returns (report_path, input_path, usage_msg).
     """
-    logger.info("Starting fresh portfolio analysis — amount: ₹%.0f, model: %s", amount, _REBALANCE_MODEL)
+    prefs = preferences or {}
+    logger.info(
+        "Starting fresh portfolio analysis — amount: ₹%.0f, prefs: %s, model: %s",
+        amount, prefs, _REBALANCE_MODEL,
+    )
 
     candidates_section, screened_quotes = _screen_fresh_portfolio_candidates()
 
@@ -1842,17 +1905,68 @@ def run_fresh_portfolio_analysis(amount: float) -> Tuple[Optional[str], Optional
 
     market_data = _build_market_data_section(ticker_data)
 
+    risk       = prefs.get("risk_appetite", "Moderate")
+    horizon    = prefs.get("horizon", "Long >5yr")
+    focus      = prefs.get("sector_focus", "All sectors")
+    avoid      = prefs.get("sector_avoid", "None")
+    count_pref = prefs.get("stock_count", "Auto")
+
+    count_instruction = {
+        "5–8 (concentrated)":  "Target 5–8 stocks. Prefer high-conviction, concentrated bets.",
+        "8–12 (balanced)":     "Target 8–12 stocks. Balance conviction with diversification.",
+        "12–15 (diversified)": "Target 12–15 stocks. Prioritise sector diversification.",
+        "Auto":                "Choose the optimal number of stocks (typically 8–12).",
+    }.get(count_pref, "Choose the optimal number of stocks (typically 8–12).")
+
+    sector_focus_line = (
+        f"**Sector Focus:** Overweight {focus} — prioritise candidates from this sector where quality meets criteria."
+        if focus != "All sectors" else
+        "**Sector Focus:** No preference — allocate across sectors based purely on quality and valuation."
+    )
+    sector_avoid_line = (
+        f"**Sectors to Avoid:** Exclude or severely underweight {avoid} sector stocks."
+        if avoid != "None" else
+        "**Sectors to Avoid:** None specified."
+    )
+
     user_message = (
         f"## Fresh Portfolio Construction Request\n\n"
         f"**Available Cash:** ₹{amount:,.0f}\n"
         f"**Universe:** NSE large-cap and upper mid-cap stocks (market cap ≥₹8,000 Cr)\n"
-        f"**Objective:** Build an optimal 10–15 stock portfolio from scratch targeting ≥20% long-term XIRR.\n"
         f"**Date:** {date.today().strftime('%d %b %Y')}\n\n"
-        f"{candidates_section}\n\n"
+        f"### Investor Preferences\n"
+        f"**Risk Appetite:** {risk}\n"
+        f"**Investment Horizon:** {horizon}\n"
+        f"{sector_focus_line}\n"
+        f"{sector_avoid_line}\n"
+        f"**Portfolio Size:** {count_instruction}\n\n"
+        f"### Risk Appetite Guidance\n"
+        + {
+            "Conservative": "- Prefer quality moats with low debt, high FCF, dividend history.\n"
+                            "- Avoid cyclicals, turnarounds, high-beta stocks.\n"
+                            "- Max single-stock weight: 8%. Min 3 defensive sectors.\n",
+            "Moderate":     "- Balance quality compounders with select GARP opportunities.\n"
+                            "- Moderate cyclical exposure (≤20% combined) acceptable.\n"
+                            "- Max single-stock weight: 12%.\n",
+            "Aggressive":   "- Allow high-growth, re-rating, and turnaround candidates.\n"
+                            "- Higher single-stock concentration acceptable (up to 15%).\n"
+                            "- Sector concentration allowed if thesis is strong.\n",
+        }.get(risk, "")
+        + f"\n### Horizon Guidance\n"
+        + {
+            "<2 years":   "- Prefer value unlocking, special situations, or momentum.\n"
+                          "- Avoid long gestation businesses or heavy capex cycles.\n",
+            "2–5 years":  "- Balance compounders with moderate growth visibility.\n"
+                          "- Acceptable to include businesses mid-cycle.\n",
+            "Long >5yr":  "- Maximise long-term compounding quality — ROE/ROCE sustainability is paramount.\n"
+                          "- Acceptable to pay fair value for exceptional businesses.\n",
+        }.get(horizon, "")
+        + f"\n{candidates_section}\n\n"
         f"{market_data}\n\n"
         "---\n"
         "Using the screened candidates and their fundamental data above, construct the optimal "
         "portfolio following the required output structure (Sections 1–5). "
+        "Strictly respect the investor preferences above. "
         "Allocate exact share counts at current CMP. Justify every inclusion and rejection."
     )
 
@@ -1862,7 +1976,8 @@ def run_fresh_portfolio_analysis(amount: float) -> Tuple[Optional[str], Optional
         f"# Fresh Portfolio Analysis — Input Prompt\n"
         f"**Generated:** {datetime.now().strftime('%d %b %Y, %I:%M %p')}  \n"
         f"**Model:** {_REBALANCE_MODEL}  \n"
-        f"**Cash Amount:** ₹{amount:,.0f}  \n\n"
+        f"**Cash Amount:** ₹{amount:,.0f}  \n"
+        f"**Risk:** {risk} | **Horizon:** {horizon} | **Focus:** {focus} | **Avoid:** {avoid} | **Count:** {count_pref}  \n\n"
         "---\n\n"
         "## System Prompt\n\n"
         f"{_FRESH_PORTFOLIO_SYSTEM_PROMPT.strip()}\n\n"
@@ -2061,9 +2176,9 @@ def run_rebalance_analysis(transactions_model) -> str:
         for tk, pos in tickers.items()
     )
     total_invested = sum(
-        pos["total_invested"]
+        pos["total_invested"] * ticker_data.get(tk, {}).get("fx_rate_to_inr", 1.0)
         for tickers in positions_by_portfolio.values()
-        for pos in tickers.values()
+        for tk, pos in tickers.items()
     )
 
     # ── Assemble context sections ──
