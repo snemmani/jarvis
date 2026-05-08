@@ -26,19 +26,20 @@ SYSTEM_PROMPT = [
     "  - CostPerShare: price per share (float). For INR stocks this is ₹, for USD stocks this is $.",
     "  - Date: in YYYY-MM-DD format. 'today', 'yesterday' etc. should be resolved using today's date.",
     "  - Portfolio: optional portfolio name if user mentions one (e.g. 'in my LT portfolio'). Default to 'Default' if not mentioned.",
+    "  - Note: optional free-text context if the user mentions thesis, trigger, caution, or any rationale for the transaction.",
     "  - CMP: omit this field — it will be updated by the scheduled job.",
     "• Example inputs → JSON:",
     "  'Sold 100 shares of PFC.NS at 12.9 today' → {{\"Ticker\": \"PFC.NS\", \"TransactionType\": \"Sell\", \"NoOfShares\": 100, \"CostPerShare\": 12.9, \"Date\": \"{today_date}\", \"Portfolio\": \"Default\"}}",
-    "  'Bought 50 INFY.NS at 1500 on 2025-03-01 in LT portfolio' → {{\"Ticker\": \"INFY.NS\", \"TransactionType\": \"Buy\", \"NoOfShares\": 50, \"CostPerShare\": 1500, \"Date\": \"2025-03-01\", \"Portfolio\": \"LT\"}}",
+    "  'Bought 50 INFY.NS at 1500 on 2025-03-01 in LT portfolio because results were strong' → {{\"Ticker\": \"INFY.NS\", \"TransactionType\": \"Buy\", \"NoOfShares\": 50, \"CostPerShare\": 1500, \"Date\": \"2025-03-01\", \"Portfolio\": \"LT\", \"Note\": \"because results were strong\"}}",
     "• Call `Transaction_Creation` with the JSON string.",
-    "• On success respond: '✅ Transaction recorded: [Buy/Sell] NoOfShares shares of Ticker at ₹CostPerShare on Date'.",
+    "• On success respond: '✅ Transaction recorded: [Buy/Sell] NoOfShares shares of Ticker at ₹CostPerShare on Date'. Mention the note briefly if one was provided.",
 
     "Use Case 1b: When the user wants to **record a cash deposit or withdrawal** (adding/removing external funds from a portfolio), follow these instructions:",
     "• This is for external cash flows only — fresh capital added or withdrawn from the portfolio. NOT for recording stock trades (buy/sell automatically updates cash).",
     "• Examples: 'deposited 50000 into my LT portfolio', 'added ₹1 lakh cash to Default', 'withdrew 20000 from ST portfolio'.",
-    "• Record as: {\"Ticker\": \"CASH\", \"TransactionType\": \"Deposit\" (or \"Withdrawal\"), \"NoOfShares\": 1, \"CostPerShare\": <amount>, \"Date\": \"<YYYY-MM-DD>\", \"Portfolio\": \"<portfolio>\"}",
-    "• 'deposit'/'add cash'/'fund' → TransactionType = 'Deposit'. 'withdraw'/'remove cash'/'take out' → TransactionType = 'Withdrawal'.",
-    "• On success respond: '✅ Cash recorded: [Deposit/Withdrawal] of ₹<amount> in <portfolio> portfolio on <date>'.",
+    "• Record as: {\"Ticker\": \"CASH\", \"TransactionType\": \"Deposit\" (or \"Withdraw\"), \"NoOfShares\": 1, \"CostPerShare\": <amount>, \"Date\": \"<YYYY-MM-DD>\", \"Portfolio\": \"<portfolio>\", \"Note\": \"<optional context>\"}",
+    "• 'deposit'/'add cash'/'fund' → TransactionType = 'Deposit'. 'withdraw'/'remove cash'/'take out' → TransactionType = 'Withdraw'.",
+    "• On success respond: '✅ Cash recorded: [Deposit/Withdraw] of ₹<amount> in <portfolio> portfolio on <date>'.",
 
     "Use Case 2: When the user wants to **list/view transactions**, follow these instructions:",
     "• Always send tool inputs as **JSON strings**.",
@@ -47,7 +48,7 @@ SYSTEM_PROMPT = [
     "• Example: 'Show all sells of PFC.NS' → {{\"filters\": [\"(Ticker,eq,text,PFC.NS)\", \"(TransactionType,eq,text,Sell)\"]}}",
     "• Example: 'Show all transactions today' → {{\"filters\": [\"(Date,ge,exactDate,{today_date})\", \"(Date,lt,exactDate,{tomorrow_date})\"]}}",
     "• Example: 'List all transactions' → pass an empty string '' to fetch all.",
-    "• Once fetched, summarise clearly grouped by Ticker or date as relevant. Show Ticker, Type, Shares, Cost, Date.",
+    "• Once fetched, summarise clearly grouped by Ticker or date as relevant. Show Ticker, Type, Shares, Cost, Date, and Note if present.",
 
     "Remember that today's date is {today_date}, and the week starts on Monday.",
 
@@ -119,7 +120,22 @@ class PortfolioManager:
         try:
             data_object = json.loads(data)
             ticker   = (data_object.get("Ticker") or "").strip().upper()
-            tx_type  = (data_object.get("TransactionType") or "").strip()
+            tx_type  = self._normalize_transaction_type(data_object.get("TransactionType"))
+            note     = str(data_object.get("Note") or "").strip()
+            data_object["Ticker"] = ticker
+            if tx_type:
+                data_object["TransactionType"] = tx_type
+            if note:
+                data_object["Note"] = note
+            else:
+                data_object.pop("Note", None)
+
+            shares = self._parse_number(data_object.get("NoOfShares"))
+            cost = self._parse_number(data_object.get("CostPerShare"))
+            if shares is not None:
+                data_object["NoOfShares"] = shares
+            if cost is not None:
+                data_object["CostPerShare"] = cost
 
             response_add = self.transactions_model.create(data_object)
             logger.info("Transaction creation response: %s", response_add)
@@ -127,14 +143,34 @@ class PortfolioManager:
                 logger.warning("Failed to add transaction entry.")
                 return "Failed to add transaction entry. Try again?"
 
-            # Auto-create offsetting CASH entry for Buy/Sell (full proceeds, no brokerage)
+            # Auto-create offsetting CASH entry for Buy/Sell (full proceeds, always in INR)
             if ticker != "CASH" and tx_type in ("Buy", "Sell"):
-                shares    = float(data_object.get("NoOfShares") or 0)
-                cost      = float(data_object.get("CostPerShare") or 0)
-                amount    = shares * cost
+                amount    = (shares or 0.0) * (cost or 0.0)
                 portfolio = (data_object.get("Portfolio") or "Default").strip()
                 date_str  = data_object.get("Date", "")
-                cash_type = "Withdrawal" if tx_type == "Buy" else "Deposit"
+                cash_type = "Withdraw" if tx_type == "Buy" else "Deposit"
+
+                # Convert to INR if the stock trades in a foreign currency
+                is_indian = ticker.upper().endswith((".NS", ".BO"))
+                if not is_indian:
+                    try:
+                        info = yf.Ticker(ticker).info or {}
+                        currency = (info.get("currency") or "INR").upper()
+                        if currency != "INR":
+                            fx_info = yf.Ticker(f"{currency}INR=X").info or {}
+                            fx_rate = (
+                                fx_info.get("regularMarketPrice")
+                                or fx_info.get("currentPrice")
+                                or 1.0
+                            )
+                            amount = round(amount * float(fx_rate), 2)
+                            logger.info(
+                                "Auto-cash FX conversion: %s %s × %.4f = ₹%.2f",
+                                currency, shares * cost, fx_rate, amount,
+                            )
+                    except Exception as fx_err:
+                        logger.warning("FX conversion failed for %s, storing native amount: %s", ticker, fx_err)
+
                 cash_entry = {
                     "Ticker":          "CASH",
                     "TransactionType": cash_type,
@@ -154,6 +190,27 @@ class PortfolioManager:
             logger.error("Error in add_transaction: %s", e, exc_info=True)
             return "Failed to add transaction due to an error."
 
+    @staticmethod
+    def _normalize_transaction_type(value) -> str:
+        text = str(value or "").strip().lower()
+        mapping = {
+            "buy": "Buy",
+            "sell": "Sell",
+            "deposit": "Deposit",
+            "withdraw": "Withdraw",
+            "withdrawal": "Withdraw",
+        }
+        return mapping.get(text, str(value or "").strip())
+
+    @staticmethod
+    def _parse_number(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        cleaned = str(value).replace(",", "").replace("₹", "").replace("$", "").strip()
+        return float(cleaned)
+
     def update_cmp(self) -> str:
         """Fetch latest prices from yfinance and update all transaction rows in NocoDB."""
         transactions = self.transactions_model.list()
@@ -172,6 +229,145 @@ class PortfolioManager:
             logger.info("Updated CMP for %s: %s", ticker, cmp)
         return "✅ CMP values updated for all tickers."
 
+    def get_dashboard_data(self) -> Dict:
+        """Return a compact portfolio snapshot for Telegram dashboard views."""
+        transactions = self.transactions_model.list()
+        if not transactions:
+            return {"as_of": datetime.now(), "portfolios": {}, "totals": {}, "holdings": [], "risk_flags": []}
+
+        usd_to_inr = self._get_usd_to_inr()
+        portfolios: Dict[str, Dict] = {}
+
+        for tx in transactions:
+            ticker = (tx.get("Ticker") or "").strip().upper()
+            tx_type = (tx.get("TransactionType") or "").strip()
+            shares = float(tx.get("NoOfShares") or 0)
+            cost = float(tx.get("CostPerShare") or 0)
+            cmp = float(tx.get("CMP") or 0)
+            portfolio = (tx.get("Portfolio") or "Default").strip()
+
+            if not ticker or shares == 0:
+                continue
+
+            entry = portfolios.setdefault(portfolio, {
+                "cash": 0.0,
+                "positions": {},
+            })
+
+            if ticker == "CASH":
+                if tx_type == "Deposit":
+                    entry["cash"] += cost
+                elif tx_type in {"Withdraw", "Withdrawal"}:
+                    entry["cash"] -= cost
+                continue
+
+            fx = 1.0 if ticker.endswith((".NS", ".BO")) else usd_to_inr
+            pos = entry["positions"].setdefault(ticker, {
+                "ticker": ticker,
+                "shares_bought": 0.0,
+                "shares_sold": 0.0,
+                "buy_cost_inr": 0.0,
+                "sell_proceeds_inr": 0.0,
+                "cmp_inr": 0.0,
+            })
+            if cmp:
+                pos["cmp_inr"] = cmp * fx
+            if tx_type == "Buy":
+                pos["shares_bought"] += shares
+                pos["buy_cost_inr"] += shares * cost * fx
+            elif tx_type == "Sell":
+                pos["shares_sold"] += shares
+                pos["sell_proceeds_inr"] += shares * cost * fx
+
+        holdings: List[Dict] = []
+        portfolio_rows: Dict[str, Dict] = {}
+        total_invested = total_current = total_cash = 0.0
+
+        for portfolio_name, pdata in portfolios.items():
+            rows: List[Dict] = []
+            invested = current = 0.0
+            for ticker, pos in pdata["positions"].items():
+                net_shares = pos["shares_bought"] - pos["shares_sold"]
+                if net_shares <= 0:
+                    continue
+                avg_cost = pos["buy_cost_inr"] / pos["shares_bought"] if pos["shares_bought"] else 0.0
+                invested_value = net_shares * avg_cost
+                current_value = net_shares * pos["cmp_inr"]
+                unrealised = current_value - invested_value
+                row = {
+                    "ticker": ticker,
+                    "portfolio": portfolio_name,
+                    "net_shares": net_shares,
+                    "avg_cost_inr": avg_cost,
+                    "cmp_inr": pos["cmp_inr"],
+                    "invested_inr": invested_value,
+                    "current_inr": current_value,
+                    "unrealised_pl": unrealised,
+                    "unrealised_pct": (unrealised / invested_value * 100) if invested_value else 0.0,
+                }
+                rows.append(row)
+                holdings.append(row)
+                invested += invested_value
+                current += current_value
+
+            cash = pdata["cash"]
+            total_value = current + cash
+            portfolio_rows[portfolio_name] = {
+                "name": portfolio_name,
+                "invested_inr": invested,
+                "current_inr": current,
+                "cash_inr": cash,
+                "total_value_inr": total_value,
+                "unrealised_pl": current - invested,
+                "holdings": sorted(rows, key=lambda item: item["current_inr"], reverse=True),
+            }
+            total_invested += invested
+            total_current += current
+            total_cash += cash
+
+        holdings.sort(key=lambda item: item["current_inr"], reverse=True)
+        grand_total = total_current + total_cash
+        for item in holdings:
+            item["weight_pct"] = (item["current_inr"] / grand_total * 100) if grand_total else 0.0
+
+        risk_flags: List[str] = []
+        concentration = [h for h in holdings if h["weight_pct"] > 15]
+        if concentration:
+            risk_flags.append(
+                "Large positions: " + ", ".join(f"{h['ticker']} {h['weight_pct']:.1f}%" for h in concentration[:3])
+            )
+        if total_cash < 0:
+            risk_flags.append(f"Negative cash balance: ₹{total_cash:,.0f}")
+        low_cmp = [h for h in holdings if h["cmp_inr"] <= 0]
+        if low_cmp:
+            risk_flags.append(f"{len(low_cmp)} holding(s) missing CMP updates")
+        if not risk_flags:
+            risk_flags.append("No immediate concentration or cash warnings.")
+
+        return {
+            "as_of": datetime.now(),
+            "totals": {
+                "invested_inr": total_invested,
+                "current_inr": total_current,
+                "cash_inr": total_cash,
+                "total_value_inr": grand_total,
+                "unrealised_pl": total_current - total_invested,
+                "unrealised_pct": ((total_current - total_invested) / total_invested * 100) if total_invested else 0.0,
+                "portfolio_count": len(portfolio_rows),
+            },
+            "portfolios": portfolio_rows,
+            "holdings": holdings,
+            "risk_flags": risk_flags,
+        }
+
+    @staticmethod
+    def _get_usd_to_inr() -> float:
+        usd_inr_ticker = yf.Ticker("USDINR=X")
+        return (
+            usd_inr_ticker.info.get("regularMarketPrice")
+            or usd_inr_ticker.fast_info.get("lastPrice", 84.0)
+        )
+
     def get_profit_loss_report(self) -> str:
         """Compute P&L across all portfolio positions and return a formatted Markdown string.
 
@@ -182,11 +378,7 @@ class PortfolioManager:
         if not transactions:
             return "📭 No portfolio transactions found."
 
-        usd_inr_ticker = yf.Ticker("USDINR=X")
-        usd_to_inr = (
-            usd_inr_ticker.info.get("regularMarketPrice")
-            or usd_inr_ticker.fast_info.get("lastPrice", 84.0)
-        )
+        usd_to_inr = self._get_usd_to_inr()
         logger.info("USD → INR rate: %s", usd_to_inr)
 
         ticker_data: Dict[tuple, Dict] = {}

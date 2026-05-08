@@ -46,7 +46,10 @@ Send it a text message, a voice note, or even a photo of a receipt — JARVIS fi
 ### 📊 Portfolio Tracker
 - Track **Indian (NSE)** and **US stock** positions across named portfolios
 - **Live CMP updates** via [yfinance](https://github.com/ranaroussi/yfinance) — scheduled every weekday at **8:15 AM IST**
-- **Profit & Loss reports** with unrealised/realised P&L, grouped by portfolio and currency
+- **Telegram portfolio dashboard** with an overall overview plus per-portfolio holdings, cash, risk, and rebalance views
+- **Prompt-gated rebalance analysis** — the bot shares the generated rebalance prompt first and only sends it to the LLM after your confirmation
+- **Forward-looking rebalance context** using stored notes, recent headlines, valuation outputs, and growth signals
+- Automatic **cash ledger updates** for stock buys/sells using `CASH` rows with `Deposit` / `Withdraw`
 - Automatic **USD → INR** conversion for US-listed stocks
 
 ### 🧠 Claude AI Dispatcher
@@ -175,12 +178,13 @@ Three tables are required. Create them in your NocoDB project and copy the table
 |---|---|---|---|
 | `Id` | Auto-number | auto | NocoDB primary key |
 | `Ticker` | Single line text | ✅ | Stock symbol e.g. `PFC.NS`, `AAPL` — append `.NS` for NSE stocks |
-| `TransactionType` | Single line text | ✅ | `Buy` or `Sell` (capitalised) |
+| `TransactionType` | Single line text | ✅ | `Buy`, `Sell`, `Deposit`, or `Withdraw` |
 | `NoOfShares` | Number (decimal) | ✅ | Number of shares |
 | `CostPerShare` | Number (decimal) | ✅ | Price per share in native currency (₹ for `.NS`, $ for US) |
 | `Date` | Date | ✅ | Transaction date, format `YYYY-MM-DD` |
 | `Portfolio` | Single line text | optional | Portfolio name e.g. `LT`, `Default` — defaults to `Default` |
 | `CMP` | Number (decimal) | optional | Current Market Price — updated automatically by the CMP scheduler |
+| `Note` | Long text | optional | Thesis, risk triggers, or transaction context used by rebalance analysis |
 
 ---
 
@@ -346,8 +350,13 @@ docker build -t jarvis . && docker run -d --network=host --name jarvis \
 | `/start` | Greeting message |
 | `/claudeApi <prompt>` | Dispatch a prompt to Claude Code CLI; session is preserved per user across calls |
 | `/portfolioSuggest` | Deep portfolio research: fetches all transactions + GrahamPrompt.md, runs web-researched Claude analysis, delivers a PDF report |
-| `/getProfitLoss` | Generate a full unrealised/realised P&L report across all portfolios |
+| `/portfolioDashboard` | Open the Telegram dashboard with overall and per-portfolio views |
 | `/updateTicker` | Manually trigger a CMP update for all tickers via yfinance |
+| `/portfolioAlerts` | Run the portfolio alert engine across current holdings |
+| `/rebalanceRecommendations` | Generate the rebalance input prompt, share it for review, and only run the LLM after confirmation |
+| `/buildPortfolio` | Build a fresh portfolio from cash amount and risk/horizon preferences |
+| `/setAlert <ticker> <above\|below\|both> <price> [action]` | Create a manual price alert with an optional action note |
+| `/listAlerts` | List, modify, or cancel active price alerts |
 | `/ddns update` | Update No-IP hostname to your current public IPv6 |
 | `/ddns block` | Mangle the last hex digit of your IPv6 to cut external access |
 | `/wakeTheBeast` | Send a Wake-on-LAN magic packet to power on your PC |
@@ -361,7 +370,8 @@ docker build -t jarvis . && docker run -d --network=host --name jarvis \
 | "Show me expenses for last week" | Lists filtered expenses |
 | "Show me MAG for this week" | Returns this week's calendar entries |
 | "I completed my exercise today" | Updates Exercise field on today's MAG row |
-| "Bought 50 INFY.NS at 1500 today in LT portfolio" | Adds a Buy transaction to PortfolioTransactions |
+| "Bought 50 INFY.NS at 1500 today in LT portfolio because results were strong" | Adds a Buy transaction to PortfolioTransactions and stores the note |
+| "Deposited 50000 cash into LT portfolio" | Adds a `CASH` `Deposit` transaction |
 | "Show my portfolio for March" | Lists transactions with date filter |
 | "What is the mass of the sun?" | Queries Wolfram Alpha, returns image pods |
 | "Translate hello to Sanskrit" | Calls GPT for translation |
@@ -419,7 +429,37 @@ Filters are passed as NocoDB query strings, e.g.:
 
 ### P&L Calculation
 
-`PortfolioManager.get_profit_loss_report()` groups transactions by `(Ticker, Portfolio)`. For each group it computes weighted average cost, net shares (buys minus sells), current value using the stored CMP, and unrealised/realised P&L. US stocks (no `.NS` suffix) are converted to INR using the live `USDINR=X` rate from yfinance.
+`PortfolioManager.get_dashboard_data()` aggregates live positions, `CASH` ledger rows, and portfolio totals into a Telegram-friendly snapshot. The dashboard is intentionally split into an overall overview plus a per-portfolio workspace for holdings, cash, risk, and rebalance.
+
+### Rebalance Approval Flow
+
+`/rebalanceRecommendations` now works in two steps:
+
+1. Build the full rebalance prompt from holdings, notes, forward outlook, valuation outputs, and candidate screens
+2. Save and send that prompt to Telegram as a document
+3. Ask the user whether the prompt should be forwarded to the LLM
+4. Only call the model if the user taps **Forward To LLM**
+5. Send the markdown rebalance report and usage/cost summary
+
+The scheduled monthly rebalance job still runs automatically without manual approval.
+
+### Forward Outlook & Valuation Engine
+
+The rebalance pipeline now includes deterministic forward context for both current holdings and candidate recommendations:
+
+- recent revenue / earnings growth
+- forward EPS vs trailing EPS
+- recent high-signal headlines
+- stored transaction notes / thesis notes
+- valuation method selection by business type
+
+Valuation methods:
+
+- **DCF + Reverse DCF** for suitable non-financials
+- **P/B-ROE** for banks and NBFCs
+- **Normalized P/E** for cyclicals, utilities, and similar names
+
+These calculations are done in Python first and then injected into the rebalance prompt, so the LLM interprets the valuation output rather than inventing it.
 
 ### Scheduled Jobs
 

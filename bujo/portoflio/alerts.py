@@ -257,7 +257,7 @@ def _classify_news(
         resp = openai_model.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
+            max_completion_tokens=600,
         )
         raw = resp.choices[0].message.content.strip()
         match = re.search(r"\[.*\]", raw, re.DOTALL)

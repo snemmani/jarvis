@@ -7,7 +7,10 @@ from bujo.models.base import BaseNocoDB
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_UPDATE_KEYS = {"Id", "Date", "Ticker", "TransactionType", "NoOfShares", "CostPerShare", "CMP"}
+_ALLOWED_UPDATE_KEYS = {
+    "Id", "Date", "Ticker", "TransactionType", "NoOfShares",
+    "CostPerShare", "CMP", "Portfolio", "Note",
+}
 
 
 class PortfolioTransactions(BaseNocoDB):

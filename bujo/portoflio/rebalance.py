@@ -1,9 +1,13 @@
 import json
 import logging
+import math
 import os
 import re
 import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -167,6 +171,19 @@ Provide 2–3 evidence points drawn strictly from the data provided — do not
 fabricate or recall management statements not present in the prompt.
 
 ════════════════════════════════════
+FORWARD ASSESSMENT SOURCE PRIORITY
+════════════════════════════════════
+For forward-looking judgments, prioritise evidence in this order:
+  1. Hard financial data and valuation metrics provided in the prompt
+  2. Recent high-signal headlines and event flags provided in the prompt
+  3. Stored transaction notes / thesis notes provided in the prompt
+  4. Multi-year trend data and Screener.in qualitative signals
+
+Do not invent management guidance, broker estimates, or catalysts not present in
+the supplied evidence. For every forward-looking recommendation, cite at least
+one concrete forward driver and one concrete forward risk from the prompt.
+
+════════════════════════════════════
 INTRINSIC VALUE CLASSIFICATION
 ════════════════════════════════════
 Classify each stock as:
@@ -295,6 +312,79 @@ _MIN_MEANINGFUL_PCT     = 5.0    # below this a "meaningful" position is undersi
 _HP_VERY_RECENT = 30
 _HP_RECENT      = 90
 _HP_MEDIUM      = 365
+_CANDIDATE_NEWS_LOOKBACK_HOURS = 72
+_FORWARD_RISK_CONS_PHRASES = (
+    "profit declined",
+    "profits declined",
+    "earnings declined",
+    "margin declined",
+    "margins declined",
+    "regulatory",
+    "warning letter",
+    "usfda",
+    "price erosion",
+    "customer concentration",
+    "product concentration",
+    "working capital",
+    "debtor days",
+    "inventory days",
+)
+_NEWS_RISK_KEYWORDS = (
+    "investigation",
+    "fraud",
+    "resignation",
+    "warning letter",
+    "usfda",
+    "import alert",
+    "pledge",
+    "downgrade",
+    "default",
+    "sanction",
+    "ban",
+    "litigation",
+    "search and seizure",
+)
+_FORWARD_POSITIVE_HEADLINE_KEYWORDS = (
+    "order win",
+    "order book",
+    "contract",
+    "approval",
+    "launch",
+    "expansion",
+    "capacity",
+    "partnership",
+    "acquisition",
+    "beat",
+    "guidance raised",
+)
+_FORWARD_NEGATIVE_HEADLINE_KEYWORDS = (
+    "investigation",
+    "fraud",
+    "resignation",
+    "downgrade",
+    "default",
+    "warning letter",
+    "ban",
+    "sanction",
+    "litigation",
+    "margin pressure",
+    "profit warning",
+    "pledge",
+)
+_FORWARD_NOTE_RISK_KEYWORDS = (
+    "exit if",
+    "trim if",
+    "re-evaluate if",
+    "governance",
+    "warning",
+    "risk",
+    "monitor",
+    "npa",
+    "margin",
+    "credit cost",
+    "rbi",
+    "sebi",
+)
 
 
 # ──────────────────────────────────────────────
@@ -315,6 +405,10 @@ def _safe_div(a, b) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 def _classify_holding_period(days: int) -> str:
@@ -375,6 +469,22 @@ def _fetch_fx_rate(from_currency: str) -> float:
     logger.info("FX rate %sINR = %.4f", from_currency, rate)
     _FX_CACHE[key] = rate
     return rate
+
+
+def _parse_analyst_rating(raw_rating: Any) -> Optional[float]:
+    if raw_rating in (None, ""):
+        return None
+    try:
+        return float(raw_rating)
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"(\d+(?:\.\d+)?)", str(raw_rating))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def _classify_sector(sector: str, industry: str) -> str:
@@ -439,7 +549,7 @@ def _compute_positions_by_portfolio(
     Returns:
       {portfolio: {ticker: {net_shares, avg_cost, total_invested,
                             buy_dates, sell_dates, total_bought, total_sold,
-                            sell_proceeds, all_buy_lots}}}
+                            sell_proceeds, all_buy_lots, notes}}}
     all_buy_lots: list of (date_str, shares, cost) for XIRR approximation.
     """
     raw: Dict[str, Dict[str, Dict]] = {}
@@ -451,6 +561,7 @@ def _compute_positions_by_portfolio(
         cost      = float(tx.get("CostPerShare") or 0)
         portfolio = (tx.get("Portfolio") or "Default").strip()
         date_str  = (tx.get("Date") or "")[:10]
+        note      = (tx.get("Note") or "").strip()
 
         if not ticker or ticker.upper() == _CASH_TICKER or shares == 0:
             continue
@@ -464,9 +575,16 @@ def _compute_positions_by_portfolio(
             "buy_dates":     [],
             "sell_dates":    [],
             "all_buy_lots":  [],
+            "notes":         [],
         })
 
         pos = raw[portfolio][ticker]
+        if note:
+            pos["notes"].append({
+                "date": date_str,
+                "type": tx_type,
+                "note": note,
+            })
         if tx_type == "Buy":
             pos["total_bought"] += shares
             pos["buy_cost"]     += shares * cost
@@ -495,6 +613,11 @@ def _compute_positions_by_portfolio(
                 "total_sold":    d["total_sold"],
                 "sell_proceeds": d["sell_proceeds"],
                 "all_buy_lots":  sorted(d["all_buy_lots"], key=lambda x: x[0]),
+                "notes":         sorted(
+                    d["notes"],
+                    key=lambda item: ((item.get("date") or ""), (item.get("type") or "")),
+                    reverse=True,
+                ),
             }
 
     return result
@@ -503,7 +626,7 @@ def _compute_positions_by_portfolio(
 def _compute_cash_by_portfolio(transactions: List[Dict]) -> Dict[str, float]:
     """
     Returns {portfolio: net_cash_balance} from explicit CASH ticker rows.
-    TransactionType 'Deposit' adds cash; 'Withdrawal' subtracts it.
+    TransactionType 'Deposit' adds cash; 'Withdraw' subtracts it.
     Amount = NoOfShares * CostPerShare (bot always records NoOfShares=1).
     """
     balances: Dict[str, float] = {}
@@ -517,7 +640,7 @@ def _compute_cash_by_portfolio(transactions: List[Dict]) -> Dict[str, float]:
         balances.setdefault(portfolio, 0.0)
         if tx_type == "Deposit":
             balances[portfolio] += amount
-        elif tx_type == "Withdrawal":
+        elif tx_type in {"Withdraw", "Withdrawal"}:
             balances[portfolio] -= amount
     return balances
 
@@ -774,11 +897,599 @@ def _fetch_ticker_data(ticker: str) -> Dict:
         # Screener.in qualitative signals (pros/cons/about)
         d["screener_data"] = _fetch_screener_data(ticker)
 
+        d["valuation"] = _compute_valuation_profile(d)
         return d
 
     except Exception as e:
         logger.warning("yfinance fetch failed for %s: %s", ticker, e)
         return {"company_name": ticker, "cmp": 0, "error": str(e)}
+
+
+def _select_valuation_method(td: Dict[str, Any]) -> str:
+    bucket = td.get("sector_bucket") or ""
+    if bucket in {"Banks", "Financials / NBFC"}:
+        return "pb_roe"
+    if bucket in {"Energy / Utilities", "Metals / Chemicals", "Real Estate"}:
+        return "normalized_pe"
+    return "dcf"
+
+
+def _estimate_cost_of_equity(td: Dict[str, Any]) -> float:
+    beta = td.get("beta")
+    beta = float(beta) if beta not in (None, "") else 1.0
+    beta = _clamp(beta, 0.6, 1.8)
+    return round(0.07 + beta * 0.06, 4)
+
+
+def _estimate_terminal_growth(td: Dict[str, Any]) -> float:
+    revenue_cagr = td.get("revenue_cagr_5y_pct")
+    if revenue_cagr is None:
+        revenue_cagr = td.get("revenue_cagr_3y_pct")
+    if revenue_cagr is None:
+        return 0.04
+    return round(_clamp(float(revenue_cagr) / 100 * 0.25, 0.03, 0.055), 4)
+
+
+def _estimate_initial_growth(td: Dict[str, Any]) -> float:
+    candidates = [
+        td.get("revenue_growth_yoy"),
+        td.get("earnings_growth_yoy"),
+        td.get("revenue_cagr_3y_pct"),
+        td.get("net_income_cagr_3y_pct"),
+    ]
+    usable = [float(v) for v in candidates if v is not None]
+    if not usable:
+        return 0.10
+    avg = sum(usable) / len(usable)
+    return round(_clamp(avg / 100, 0.04, 0.18), 4)
+
+
+def _compute_dcf_value(td: Dict[str, Any]) -> Dict[str, Any]:
+    fcf_cr = td.get("free_cash_flow_cr")
+    shares_cr = td.get("shares_outstanding_cr")
+    cmp = td.get("cmp") or 0
+    if not fcf_cr or fcf_cr <= 0 or not shares_cr or shares_cr <= 0:
+        return {"applicable": False, "reason": "Insufficient positive FCF/share data for DCF"}
+
+    cost = _estimate_cost_of_equity(td)
+    terminal = _estimate_terminal_growth(td)
+    if cost <= terminal:
+        cost = terminal + 0.03
+    initial = _estimate_initial_growth(td)
+    scenarios = {
+        "bear": (_clamp(initial - 0.04, 0.02, 0.14), _clamp(terminal - 0.005, 0.025, 0.05)),
+        "base": (initial, terminal),
+        "bull": (_clamp(initial + 0.03, 0.05, 0.22), _clamp(terminal + 0.005, 0.03, 0.06)),
+    }
+    per_share: Dict[str, float] = {}
+    for name, (growth, term_growth) in scenarios.items():
+        pv = 0.0
+        cash_flow = float(fcf_cr)
+        for year in range(1, 6):
+            fade_growth = growth + (term_growth - growth) * ((year - 1) / 4)
+            cash_flow *= (1 + fade_growth)
+            pv += cash_flow / ((1 + cost) ** year)
+        terminal_value = (cash_flow * (1 + term_growth)) / max(cost - term_growth, 0.01)
+        pv += terminal_value / ((1 + cost) ** 5)
+        per_share[name] = round(pv / shares_cr, 2)
+
+    base_value = per_share["base"]
+    mos = round((base_value / cmp - 1) * 100, 1) if cmp else None
+    return {
+        "applicable": True,
+        "method": "DCF",
+        "cost_of_equity_pct": round(cost * 100, 2),
+        "terminal_growth_pct": round(terminal * 100, 2),
+        "initial_growth_pct": round(initial * 100, 2),
+        "per_share": per_share,
+        "margin_of_safety_pct": mos,
+    }
+
+
+def _compute_reverse_dcf(td: Dict[str, Any]) -> Dict[str, Any]:
+    fcf_cr = td.get("free_cash_flow_cr")
+    market_cap_cr = td.get("market_cap_cr")
+    if not fcf_cr or fcf_cr <= 0 or not market_cap_cr or market_cap_cr <= 0:
+        return {"applicable": False, "reason": "Insufficient positive FCF/market-cap data for reverse DCF"}
+
+    cost = _estimate_cost_of_equity(td)
+    terminal = _estimate_terminal_growth(td)
+    if cost <= terminal:
+        cost = terminal + 0.03
+
+    def implied_value(growth: float) -> float:
+        pv = 0.0
+        cash_flow = float(fcf_cr)
+        for year in range(1, 6):
+            cash_flow *= (1 + growth)
+            pv += cash_flow / ((1 + cost) ** year)
+        terminal_value = (cash_flow * (1 + terminal)) / max(cost - terminal, 0.01)
+        pv += terminal_value / ((1 + cost) ** 5)
+        return pv
+
+    low, high = -0.10, 0.40
+    for _ in range(50):
+        mid = (low + high) / 2
+        if implied_value(mid) < market_cap_cr:
+            low = mid
+        else:
+            high = mid
+    implied_growth = round(((low + high) / 2) * 100, 2)
+    return {
+        "applicable": True,
+        "method": "Reverse DCF",
+        "cost_of_equity_pct": round(cost * 100, 2),
+        "terminal_growth_pct": round(terminal * 100, 2),
+        "implied_fcf_growth_5y_pct": implied_growth,
+    }
+
+
+def _compute_pb_roe_value(td: Dict[str, Any]) -> Dict[str, Any]:
+    book_value = td.get("book_value")
+    roe = td.get("roe")
+    pb = td.get("pb")
+    cmp = td.get("cmp") or 0
+    if not book_value or book_value <= 0 or roe is None:
+        return {"applicable": False, "reason": "Missing book value / ROE for P/B-ROE valuation"}
+
+    cost = _estimate_cost_of_equity(td)
+    roe_dec = float(roe) / 100
+    payout = td.get("payout_ratio")
+    payout_dec = _clamp((float(payout) / 100) if payout is not None else 0.20, 0.05, 0.60)
+    growth = _clamp(roe_dec * (1 - payout_dec) * 0.55, 0.04, 0.12)
+    justified_pb = max((roe_dec - growth) / max(cost - growth, 0.01), 0.4)
+    fair_value = round(book_value * justified_pb, 2)
+    implied_roe = None
+    if pb:
+        implied_roe = round((float(pb) * (cost - growth) + growth) * 100, 2)
+    mos = round((fair_value / cmp - 1) * 100, 1) if cmp else None
+    return {
+        "applicable": True,
+        "method": "P/B-ROE",
+        "cost_of_equity_pct": round(cost * 100, 2),
+        "growth_pct": round(growth * 100, 2),
+        "justified_pb": round(justified_pb, 2),
+        "fair_value_per_share": fair_value,
+        "margin_of_safety_pct": mos,
+        "implied_sustainable_roe_pct": implied_roe,
+    }
+
+
+def _compute_normalized_pe_value(td: Dict[str, Any]) -> Dict[str, Any]:
+    eps_values = [v for v in [td.get("eps_ttm"), td.get("eps_forward")] if v not in (None, 0)]
+    cmp = td.get("cmp") or 0
+    if not eps_values:
+        return {"applicable": False, "reason": "Missing EPS data for normalized P/E valuation"}
+
+    normalized_eps = sum(float(v) for v in eps_values) / len(eps_values)
+    growth = td.get("earnings_growth_yoy")
+    if growth is None:
+        growth = td.get("net_income_cagr_3y_pct")
+    growth = float(growth) if growth is not None else 8.0
+    fair_pe = _clamp(8 + max(growth, 0) * 0.35, 8, 22)
+    fair_value = round(normalized_eps * fair_pe, 2)
+    mos = round((fair_value / cmp - 1) * 100, 1) if cmp else None
+    earnings_yield = round((normalized_eps / cmp * 100), 2) if cmp else None
+    return {
+        "applicable": True,
+        "method": "Normalized P/E",
+        "normalized_eps": round(normalized_eps, 2),
+        "fair_pe": round(fair_pe, 2),
+        "fair_value_per_share": fair_value,
+        "margin_of_safety_pct": mos,
+        "current_earnings_yield_pct": earnings_yield,
+    }
+
+
+def _compute_valuation_profile(td: Dict[str, Any]) -> Dict[str, Any]:
+    method = _select_valuation_method(td)
+    if method == "pb_roe":
+        primary = _compute_pb_roe_value(td)
+        reverse = {
+            "applicable": primary.get("applicable", False),
+            "method": "Reverse P/B-ROE",
+            "implied_sustainable_roe_pct": primary.get("implied_sustainable_roe_pct"),
+        }
+    elif method == "normalized_pe":
+        primary = _compute_normalized_pe_value(td)
+        reverse = _compute_reverse_dcf(td)
+    else:
+        primary = _compute_dcf_value(td)
+        reverse = _compute_reverse_dcf(td)
+
+    verdict = "Low-confidence valuation"
+    ref_value = (
+        (primary.get("per_share") or {}).get("base")
+        if primary.get("method") == "DCF"
+        else primary.get("fair_value_per_share")
+    )
+    cmp = td.get("cmp") or 0
+    if ref_value and cmp:
+        gap = ref_value / cmp - 1
+        if gap >= 0.2:
+            verdict = "Undervalued"
+        elif gap <= -0.15:
+            verdict = "Overvalued"
+        else:
+            verdict = "Fairly valued"
+
+    return {
+        "primary_method": primary.get("method") if primary.get("applicable") else method.upper(),
+        "primary": primary,
+        "reverse": reverse,
+        "verdict": verdict,
+        "confidence": "Medium" if primary.get("applicable") else "Low",
+    }
+
+
+def _fetch_candidate_news(company_name: str, ticker: str) -> List[str]:
+    clean_ticker = re.sub(r"\.(NS|BO)$", "", ticker, flags=re.IGNORECASE)
+    query = urllib.parse.quote(f'"{company_name}" OR "{clean_ticker}" stock')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        resp = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        cutoff = datetime.now() - timedelta(hours=_CANDIDATE_NEWS_LOOKBACK_HOURS)
+        headlines: List[str] = []
+        for item in root.findall(".//item")[:20]:
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            pub_str = item.findtext("pubDate", "")
+            try:
+                pub_dt = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                if pub_dt < cutoff:
+                    continue
+            except Exception:
+                pass
+            headlines.append(title)
+        return headlines
+    except Exception as exc:
+        logger.debug("Candidate news fetch failed for %s: %s", ticker, exc)
+        return []
+
+
+def _fetch_recent_headlines(company_name: str, ticker: str, lookback_hours: int = _CANDIDATE_NEWS_LOOKBACK_HOURS) -> List[str]:
+    clean_ticker = re.sub(r"\.(NS|BO)$", "", ticker, flags=re.IGNORECASE)
+    query = urllib.parse.quote(f'"{company_name}" OR "{clean_ticker}" stock')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        cutoff = datetime.now() - timedelta(hours=lookback_hours)
+        headlines: List[str] = []
+        for item in root.findall(".//item")[:12]:
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            pub_str = item.findtext("pubDate", "")
+            try:
+                pub_dt = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                if pub_dt < cutoff:
+                    continue
+            except Exception:
+                pass
+            headlines.append(title)
+        return headlines
+    except Exception as exc:
+        logger.debug("Recent headline fetch failed for %s: %s", ticker, exc)
+        return []
+
+
+def _check_candidate_events_and_news(ticker: str) -> List[str]:
+    risks: List[str] = []
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        info = yf_ticker.info or {}
+        today = date.today()
+
+        cal = yf_ticker.calendar
+        if cal is not None:
+            earnings_dates: List[date] = []
+            if isinstance(cal, dict):
+                raw_dates = cal.get("Earnings Date")
+                if raw_dates:
+                    earnings_dates = raw_dates if isinstance(raw_dates, list) else [raw_dates]
+            else:
+                for col in cal.columns:
+                    earnings_dates.append(col.date() if hasattr(col, "date") else col)
+            for ed in earnings_dates:
+                if isinstance(ed, datetime):
+                    ed = ed.date()
+                if isinstance(ed, date):
+                    days_away = (ed - today).days
+                    if 0 <= days_away <= 14:
+                        risks.append(f"earnings event in {days_away} day(s) on {ed}")
+                        break
+
+        ex_div_ts = info.get("exDividendDate")
+        if ex_div_ts:
+            try:
+                ex_div = date.fromtimestamp(ex_div_ts)
+                days_away = (ex_div - today).days
+                if 0 <= days_away <= 7:
+                    risks.append(f"ex-dividend date is close on {ex_div}")
+            except Exception:
+                pass
+
+        company_name = info.get("shortName") or info.get("longName") or ticker
+        headlines = _fetch_candidate_news(company_name, ticker)
+        for headline in headlines:
+            lowered = headline.lower()
+            for keyword in _NEWS_RISK_KEYWORDS:
+                if keyword in lowered:
+                    risks.append(f"recent headline risk: {headline}")
+                    break
+    except Exception as exc:
+        logger.debug("Candidate events/news check failed for %s: %s", ticker, exc)
+    return risks[:3]
+
+
+def _assess_forward_risk(
+    ticker: str,
+    quote: Dict[str, Any],
+    td: Dict[str, Any],
+    event_risks: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    hard_reject_reasons: List[str] = []
+    watchlist_reasons: List[str] = []
+
+    eps_ttm = td.get("eps_ttm")
+    eps_forward = td.get("eps_forward")
+    pe_ttm = td.get("pe_ttm")
+    pe_forward = td.get("pe_forward")
+    revenue_growth = td.get("revenue_growth_yoy")
+    earnings_growth = td.get("earnings_growth_yoy")
+    analyst_rating = _parse_analyst_rating(quote.get("averageAnalystRating"))
+    ccr = td.get("cash_conversion_ratio")
+    screener_cons = td.get("screener_data", {}).get("cons") or []
+    cons_text = " ".join(str(item).lower() for item in screener_cons)
+
+    if earnings_growth is not None and earnings_growth < 0:
+        hard_reject_reasons.append(f"earnings growth is negative at {earnings_growth:.1f}%")
+    if revenue_growth is not None and revenue_growth < 0:
+        watchlist_reasons.append(f"revenue growth is negative at {revenue_growth:.1f}%")
+
+    if eps_ttm is not None and eps_forward is not None and eps_ttm > 0:
+        if eps_forward < eps_ttm * 0.9:
+            hard_reject_reasons.append(
+                f"forward EPS ₹{eps_forward:.2f} is materially below trailing EPS ₹{eps_ttm:.2f}"
+            )
+        elif eps_forward < eps_ttm:
+            watchlist_reasons.append(
+                f"forward EPS ₹{eps_forward:.2f} is below trailing EPS ₹{eps_ttm:.2f}"
+            )
+
+    if (
+        pe_ttm and pe_forward and pe_ttm > 0 and pe_forward > pe_ttm * 1.2
+        and ((earnings_growth is not None and earnings_growth < 10) or
+             (revenue_growth is not None and revenue_growth < 10))
+    ):
+        watchlist_reasons.append(
+            f"forward P/E {pe_forward:.1f} is stretched vs trailing P/E {pe_ttm:.1f} without enough growth support"
+        )
+
+    if analyst_rating is not None and analyst_rating >= 3.5:
+        hard_reject_reasons.append(f"analyst rating is weak at {analyst_rating:.1f}")
+    elif analyst_rating is not None and analyst_rating >= 3.0:
+        watchlist_reasons.append(f"analyst rating is cautious at {analyst_rating:.1f}")
+
+    matched_cons = [phrase for phrase in _FORWARD_RISK_CONS_PHRASES if phrase in cons_text]
+    if matched_cons:
+        hard_reject_reasons.append(
+            "Screener.in cons flag forward risk: " + ", ".join(sorted(set(matched_cons))[:3])
+        )
+
+    if ccr is not None and ccr < 0.8:
+        watchlist_reasons.append(f"cash conversion ratio is weak at {ccr:.2f}")
+
+    forensic_flags = td.get("forensic_flags") or []
+    if len(forensic_flags) >= 2:
+        watchlist_reasons.append(f"{len(forensic_flags)} forensic flags need review")
+
+    for risk in event_risks or []:
+        watchlist_reasons.append(risk)
+
+    if hard_reject_reasons:
+        status = "rejected"
+    elif watchlist_reasons:
+        status = "watchlist"
+    else:
+        status = "eligible"
+
+    return {
+        "ticker": ticker,
+        "status": status,
+        "hard_reject_reasons": hard_reject_reasons,
+        "watchlist_reasons": watchlist_reasons,
+        "all_reasons": hard_reject_reasons + watchlist_reasons,
+    }
+
+
+def _summarize_forward_outlook(
+    ticker: str,
+    td: Dict[str, Any],
+    recent_notes: Optional[List[str]] = None,
+    headlines: Optional[List[str]] = None,
+    gate_assessment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    score = 0
+    evidence: List[str] = []
+    cautions: List[str] = []
+
+    revenue_growth = td.get("revenue_growth_yoy")
+    earnings_growth = td.get("earnings_growth_yoy")
+    eps_ttm = td.get("eps_ttm")
+    eps_forward = td.get("eps_forward")
+    pe_ttm = td.get("pe_ttm")
+    pe_forward = td.get("pe_forward")
+    peg = td.get("peg")
+    roe = td.get("roe")
+    op_margin = td.get("operating_margin")
+    ccr = td.get("cash_conversion_ratio")
+    nde = td.get("net_debt_to_ebitda")
+    forensic_flags = td.get("forensic_flags") or []
+    screener = td.get("screener_data") or {}
+
+    if revenue_growth is not None:
+        if revenue_growth >= 15:
+            score += 2
+            evidence.append(f"revenue growth is healthy at {revenue_growth:.1f}%")
+        elif revenue_growth >= 8:
+            score += 1
+            evidence.append(f"revenue growth is positive at {revenue_growth:.1f}%")
+        elif revenue_growth < 0:
+            score -= 1
+            cautions.append(f"revenue growth is negative at {revenue_growth:.1f}%")
+
+    if earnings_growth is not None:
+        if earnings_growth >= 15:
+            score += 2
+            evidence.append(f"earnings growth is strong at {earnings_growth:.1f}%")
+        elif earnings_growth >= 8:
+            score += 1
+            evidence.append(f"earnings growth is positive at {earnings_growth:.1f}%")
+        elif earnings_growth < 0:
+            score -= 2
+            cautions.append(f"earnings growth is negative at {earnings_growth:.1f}%")
+
+    if eps_ttm and eps_forward:
+        if eps_forward >= eps_ttm * 1.1:
+            score += 2
+            evidence.append(f"forward EPS ₹{eps_forward:.2f} is above trailing EPS ₹{eps_ttm:.2f}")
+        elif eps_forward > eps_ttm:
+            score += 1
+            evidence.append(f"forward EPS ₹{eps_forward:.2f} is ahead of trailing EPS ₹{eps_ttm:.2f}")
+        elif eps_forward < eps_ttm * 0.9:
+            score -= 2
+            cautions.append(f"forward EPS ₹{eps_forward:.2f} is materially below trailing EPS ₹{eps_ttm:.2f}")
+        elif eps_forward < eps_ttm:
+            score -= 1
+            cautions.append(f"forward EPS ₹{eps_forward:.2f} is below trailing EPS ₹{eps_ttm:.2f}")
+
+    if peg is not None and peg > 0:
+        if peg <= 1.5:
+            score += 1
+            evidence.append(f"PEG {peg:.2f} supports GARP-style compounding")
+        elif peg >= 2.5:
+            score -= 1
+            cautions.append(f"PEG {peg:.2f} looks expensive for the growth on offer")
+
+    if pe_ttm and pe_forward and pe_forward < pe_ttm:
+        score += 1
+        evidence.append(f"forward P/E {pe_forward:.1f} is below trailing P/E {pe_ttm:.1f}")
+    elif pe_ttm and pe_forward and pe_forward > pe_ttm * 1.2:
+        score -= 1
+        cautions.append(f"forward P/E {pe_forward:.1f} is stretched vs trailing P/E {pe_ttm:.1f}")
+
+    if roe is not None and roe >= 15:
+        score += 1
+        evidence.append(f"ROE remains solid at {roe:.1f}%")
+    if op_margin is not None and op_margin >= 15:
+        score += 1
+        evidence.append(f"operating margin at {op_margin:.1f}% suggests some durability")
+    elif op_margin is not None and op_margin < 8:
+        score -= 1
+        cautions.append(f"operating margin at {op_margin:.1f}% leaves less room for execution misses")
+
+    if ccr is not None and ccr >= 0.9:
+        score += 1
+        evidence.append(f"cash conversion ratio {ccr:.2f} supports earnings quality")
+    elif ccr is not None and ccr < 0.8:
+        score -= 1
+        cautions.append(f"cash conversion ratio {ccr:.2f} weakens forward confidence")
+
+    if nde is not None and nde > 3:
+        score -= 1
+        cautions.append(f"net debt / EBITDA at {nde:.2f}x raises balance-sheet risk")
+    elif nde is not None and nde <= 1.5:
+        score += 1
+        evidence.append(f"net debt / EBITDA at {nde:.2f}x leaves balance-sheet flexibility")
+
+    if len(forensic_flags) >= 2:
+        score -= 2
+        cautions.append(f"{len(forensic_flags)} forensic flags weaken long-term compounding confidence")
+
+    pros = screener.get("pros") or []
+    cons = screener.get("cons") or []
+    if pros:
+        score += 1
+        evidence.append(f"Screener.in pros include: {pros[0]}")
+    if cons:
+        score -= 1
+        cautions.append(f"Screener.in cons include: {cons[0]}")
+
+    positive_news = []
+    negative_news = []
+    for title in headlines or []:
+        lower = title.lower()
+        if any(keyword in lower for keyword in _FORWARD_POSITIVE_HEADLINE_KEYWORDS):
+            positive_news.append(title)
+        if any(keyword in lower for keyword in _FORWARD_NEGATIVE_HEADLINE_KEYWORDS):
+            negative_news.append(title)
+    if positive_news:
+        score += 1
+        evidence.append(f"recent headline support: {positive_news[0]}")
+    if negative_news:
+        score -= 1
+        cautions.append(f"recent headline risk: {negative_news[0]}")
+
+    matched_note_risks = []
+    for note in recent_notes or []:
+        lower = note.lower()
+        for keyword in _FORWARD_NOTE_RISK_KEYWORDS:
+            if keyword in lower:
+                matched_note_risks.append(keyword)
+    if matched_note_risks:
+        cautions.append("stored notes contain active risk triggers: " + ", ".join(sorted(set(matched_note_risks))[:4]))
+
+    if gate_assessment:
+        status = gate_assessment.get("status")
+        if status == "eligible":
+            score += 1
+            evidence.append("deterministic gate considers the setup eligible for fresh capital")
+        elif status == "watchlist":
+            score -= 1
+            cautions.extend(gate_assessment.get("all_reasons")[:2])
+        elif status == "rejected":
+            score -= 3
+            cautions.extend(gate_assessment.get("all_reasons")[:3])
+
+    evidence = evidence[:4]
+    cautions = cautions[:4]
+    evidence_count = len(evidence) + len(cautions)
+    if evidence_count <= 1:
+        outlook = "High Uncertainty"
+        xirr_band = "Unclear"
+    elif score >= 5:
+        outlook = "High Compounding Potential"
+        xirr_band = ">20%"
+    elif score >= 2:
+        outlook = "Moderate Compounding Potential"
+        xirr_band = "15–20%"
+    elif score >= 0:
+        outlook = "Low Forward Return Potential"
+        xirr_band = "10–15%"
+    else:
+        outlook = "High Uncertainty"
+        xirr_band = "<10%"
+
+    return {
+        "ticker": ticker,
+        "outlook": outlook,
+        "xirr_band": xirr_band,
+        "score": score,
+        "evidence": evidence,
+        "cautions": cautions,
+        "headlines": (headlines or [])[:3],
+    }
 
 
 def _compute_forensic_flags(d: Dict, fin: List[Dict], bs: List[Dict], cf: List[Dict]) -> List[str]:
@@ -973,6 +1684,33 @@ def _build_positions_table(
     return "\n".join(lines)
 
 
+def _build_position_notes_section(
+    positions_by_portfolio: Dict[str, Dict[str, Dict]],
+) -> str:
+    lines: List[str] = ["## Transaction Notes Context\n"]
+    any_notes = False
+
+    for portfolio, tickers in positions_by_portfolio.items():
+        portfolio_lines: List[str] = []
+        for ticker, pos in tickers.items():
+            notes = pos.get("notes") or []
+            if not notes:
+                continue
+            any_notes = True
+            portfolio_lines.append(f"### {portfolio} — {ticker}")
+            for note in notes[:5]:
+                note_date = note.get("date") or "Unknown date"
+                note_type = note.get("type") or "Txn"
+                portfolio_lines.append(f"- {note_date} [{note_type}] {note.get('note')}")
+            portfolio_lines.append("")
+        if portfolio_lines:
+            lines.extend(portfolio_lines)
+
+    if not any_notes:
+        lines.append("_No transaction notes recorded in the portfolio transactions table._")
+    return "\n".join(lines)
+
+
 def _build_duplicate_exposure_table(
     positions_by_portfolio: Dict[str, Dict[str, Dict]],
     ticker_data: Dict[str, Dict],
@@ -1141,6 +1879,56 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
         lines.append(f"**Business:** {td.get('business_summary', 'N/A')}")
         lines.append("")
 
+        valuation = td.get("valuation") or {}
+        primary = valuation.get("primary") or {}
+        reverse = valuation.get("reverse") or {}
+        lines.append("**Valuation Engine:**")
+        lines.append(
+            f"- Method: {valuation.get('primary_method', 'N/A')} | Verdict: {valuation.get('verdict', 'N/A')} | Confidence: {valuation.get('confidence', 'Low')}"
+        )
+        if primary.get("method") == "DCF" and primary.get("applicable"):
+            per_share = primary.get("per_share") or {}
+            lines.append(
+                f"- DCF per-share value — Bear ₹{per_share.get('bear')} | Base ₹{per_share.get('base')} | Bull ₹{per_share.get('bull')} | "
+                f"Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+            )
+            lines.append(
+                f"- DCF assumptions — Cost of Equity {primary.get('cost_of_equity_pct')}% | "
+                f"Initial Growth {primary.get('initial_growth_pct')}% | Terminal Growth {primary.get('terminal_growth_pct')}%"
+            )
+        elif primary.get("method") == "P/B-ROE" and primary.get("applicable"):
+            lines.append(
+                f"- Fair value/share ₹{primary.get('fair_value_per_share')} | Justified P/B {primary.get('justified_pb')} | "
+                f"Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+            )
+            lines.append(
+                f"- P/B-ROE inputs — Cost of Equity {primary.get('cost_of_equity_pct')}% | "
+                f"Sustainable Growth {primary.get('growth_pct')}% | Implied Sustainable ROE at current P/B {primary.get('implied_sustainable_roe_pct')}%"
+            )
+        elif primary.get("method") == "Normalized P/E" and primary.get("applicable"):
+            lines.append(
+                f"- Fair value/share ₹{primary.get('fair_value_per_share')} | Fair P/E {primary.get('fair_pe')}x | "
+                f"Normalized EPS ₹{primary.get('normalized_eps')} | Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+            )
+            lines.append(
+                f"- Earnings yield at CMP: {primary.get('current_earnings_yield_pct')}%"
+            )
+        else:
+            lines.append(f"- Primary valuation unavailable: {primary.get('reason', 'Missing inputs')}")
+
+        if reverse.get("applicable"):
+            if reverse.get("method") == "Reverse DCF":
+                lines.append(
+                    f"- Reverse DCF: CMP implies ~{reverse.get('implied_fcf_growth_5y_pct')}% 5Y FCF growth "
+                    f"(CoE {reverse.get('cost_of_equity_pct')}%, terminal growth {reverse.get('terminal_growth_pct')}%)"
+                )
+            elif reverse.get("method") == "Reverse P/B-ROE":
+                lines.append(
+                    f"- Reverse valuation: current P/B implies sustainable ROE of ~{reverse.get('implied_sustainable_roe_pct')}%"
+                )
+        else:
+            lines.append(f"- Reverse valuation unavailable: {reverse.get('reason', 'Missing inputs')}")
+
         # Valuation (Part F + G)
         lines.append("**Valuation Multiples:**")
         lines.append(
@@ -1179,6 +1967,10 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
         lines.append("\n**Growth Profile (GARP Criteria):**")
         lines.append(
             f"- Revenue YoY: {td.get('revenue_growth_yoy')}% | Earnings YoY: {td.get('earnings_growth_yoy')}%"
+        )
+        lines.append(
+            f"- Forward EPS vs TTM EPS: ₹{td.get('eps_forward')} vs ₹{td.get('eps_ttm')} | "
+            f"Forward P/E vs TTM P/E: {td.get('pe_forward')} vs {td.get('pe_ttm')}"
         )
         lines.append(
             f"- Revenue CAGR 3Y: {td.get('revenue_cagr_3y_pct')}% | 5Y: {td.get('revenue_cagr_5y_pct')}%"
@@ -1322,6 +2114,66 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
 
         lines.append("\n" + "─" * 60 + "\n")
 
+    return "\n".join(lines)
+
+
+def _build_forward_outlook_section(
+    positions_by_portfolio: Dict[str, Dict[str, Dict]],
+    ticker_data: Dict[str, Dict],
+) -> str:
+    lines = ["## Forward Outlook — Current Holdings\n"]
+    for portfolio, tickers in positions_by_portfolio.items():
+        portfolio_lines: List[str] = []
+        for ticker, pos in tickers.items():
+            td = ticker_data.get(ticker, {})
+            company_name = td.get("company_name") or ticker
+            notes = [n.get("note", "") for n in (pos.get("notes") or [])[:3] if n.get("note")]
+            headlines = _fetch_recent_headlines(company_name, ticker)
+            outlook = _summarize_forward_outlook(ticker, td, recent_notes=notes, headlines=headlines)
+            portfolio_lines.append(
+                f"### {portfolio} — {ticker}\n"
+                f"- Forward class: **{outlook['outlook']}** | Expected XIRR band: **{outlook['xirr_band']}**\n"
+                f"- Positive evidence: {'; '.join(outlook['evidence']) if outlook['evidence'] else 'Limited hard forward positives available'}\n"
+                f"- Key cautions: {'; '.join(outlook['cautions']) if outlook['cautions'] else 'No major forward caution flags from current data'}\n"
+                f"- Recent headlines: {' | '.join(outlook['headlines']) if outlook['headlines'] else 'No recent high-signal headlines captured'}"
+            )
+            if notes:
+                portfolio_lines.append(f"- Stored thesis notes: {' | '.join(notes[:2])}")
+            portfolio_lines.append("")
+        if portfolio_lines:
+            lines.extend(portfolio_lines)
+    return "\n".join(lines)
+
+
+def _build_candidate_forward_outlook_section(
+    candidate_rows: List[Dict[str, Any]],
+) -> str:
+    lines = ["## Forward Outlook — Candidate Recommendations\n"]
+    if not candidate_rows:
+        lines.append("_No screened candidates available for forward assessment._")
+        return "\n".join(lines)
+
+    for row in candidate_rows:
+        ticker = row["ticker"]
+        td = row["ticker_data"]
+        assessment = row["assessment"]
+        quote = row.get("quote") or {}
+        headlines = _fetch_recent_headlines(td.get("company_name") or ticker, ticker)
+        outlook = _summarize_forward_outlook(
+            ticker,
+            td,
+            headlines=headlines,
+            gate_assessment=assessment,
+        )
+        analyst = _parse_analyst_rating(quote.get("averageAnalystRating"))
+        lines.append(
+            f"### {ticker} — {td.get('company_name', ticker)}\n"
+            f"- Gate status: **{assessment.get('status', 'unknown').title()}** | Forward class: **{outlook['outlook']}** | Expected XIRR band: **{outlook['xirr_band']}**\n"
+            f"- Positive evidence: {'; '.join(outlook['evidence']) if outlook['evidence'] else 'Limited hard forward positives available'}\n"
+            f"- Key cautions: {'; '.join(outlook['cautions']) if outlook['cautions'] else 'No major forward caution flags from current data'}\n"
+            f"- Supporting data: Analyst rating {analyst if analyst is not None else 'N/A'} | PEG {td.get('peg')} | Revenue YoY {td.get('revenue_growth_yoy')}% | Earnings YoY {td.get('earnings_growth_yoy')}%\n"
+            f"- Recent headlines: {' | '.join(outlook['headlines']) if outlook['headlines'] else 'No recent high-signal headlines captured'}\n"
+        )
     return "\n".join(lines)
 
 
@@ -1482,7 +2334,9 @@ _CAP_MID          = 20_000_000_000   # ₹2,000 Cr  — Category B (rebalance)
 _CAP_SMALL        = 10_000_000_000   # ₹1,000 Cr  — Category C (rebalance)
 _CAP_FRESH_MIN    = 80_000_000_000   # ₹8,000 Cr  — fresh portfolio: large + upper mid-cap only
 
-_SCREEN_SIZE_PER_CATEGORY = 10  # candidates fetched per category before dedup
+_SCREEN_SIZE_PER_CATEGORY = int(
+    os.environ.get("REBALANCE_SCREEN_SIZE_PER_CATEGORY", "30")
+)  # candidates fetched per sub-screen before dedup and AI filtering
 
 
 def _run_screen(query, sort_field: str, size: int) -> List[Dict]:
@@ -1670,7 +2524,71 @@ def _render_screener_table(
     return lines
 
 
-def _screen_nse_candidates(exclude_tickers: set) -> str:
+def _render_candidate_gate_table(rows: List[Dict[str, Any]], title: str) -> List[str]:
+    if not rows:
+        return [f"### {title}", "_None_\n"]
+
+    lines = [
+        f"### {title}",
+        "| Symbol | Company | Status | Key Reason(s) |",
+        "|--------|---------|--------|---------------|",
+    ]
+    for row in rows:
+        symbol = row["ticker"]
+        company = row["quote"].get("shortName") or row["quote"].get("longName") or symbol
+        company = company[:28]
+        reasons = "; ".join(row["assessment"]["all_reasons"][:2]) or "Passed forward-risk gate"
+        lines.append(
+            f"| {symbol} | {company} | {row['assessment']['status']} | {reasons} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _evaluate_screened_candidates(
+    screened_quotes: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], str, List[Dict[str, Any]]]:
+    eligible_quotes: Dict[str, Dict[str, Any]] = {}
+    eligible_ticker_data: Dict[str, Dict[str, Any]] = {}
+    review_rows: List[Dict[str, Any]] = []
+
+    for symbol in sorted(screened_quotes):
+        quote = screened_quotes[symbol]
+        td = _fetch_ticker_data(symbol)
+        event_risks = _check_candidate_events_and_news(symbol)
+        assessment = _assess_forward_risk(symbol, quote, td, event_risks)
+        review_rows.append({
+            "ticker": symbol,
+            "quote": quote,
+            "ticker_data": td,
+            "assessment": assessment,
+        })
+        if assessment["status"] == "eligible":
+            eligible_quotes[symbol] = quote
+            eligible_ticker_data[symbol] = td
+        logger.info(
+            "Candidate gate %s -> %s (%s)",
+            symbol,
+            assessment["status"],
+            "; ".join(assessment["all_reasons"][:2]) or "passed",
+        )
+
+    passed = [row for row in review_rows if row["assessment"]["status"] == "eligible"]
+    watchlist = [row for row in review_rows if row["assessment"]["status"] == "watchlist"]
+    rejected = [row for row in review_rows if row["assessment"]["status"] == "rejected"]
+
+    lines = [
+        "## Forward-Risk And Event Gate\n",
+        "_Candidates below are filtered by deterministic forward checks before the AI may recommend them. "
+        "Rejected names must not be recommended for fresh entry. Watchlist names may be discussed but not selected._\n",
+    ]
+    lines.extend(_render_candidate_gate_table(passed, "Eligible"))
+    lines.extend(_render_candidate_gate_table(watchlist, "Watchlist / Needs Manual Review"))
+    lines.extend(_render_candidate_gate_table(rejected, "Rejected Due To Forward Risk"))
+    return eligible_quotes, eligible_ticker_data, "\n".join(lines), review_rows
+
+
+def _screen_nse_candidates(exclude_tickers: set) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """
     Screen NSE candidates across sector-aware sub-queries for Categories A / B / C.
     Excludes tickers already held in the portfolio.
@@ -1684,10 +2602,12 @@ def _screen_nse_candidates(exclude_tickers: set) -> str:
     ]
 
     seen: set       = set()
+    all_quotes: Dict[str, Dict[str, Any]] = {}
     sections: List[str] = [
         "## NSE Candidate Stocks for New Entry (Sector-Aware Screen)\n",
         "_NSE-listed only. Sector-appropriate P/E thresholds: Banks use P/B; "
-        "FMCG P/E<80; Tech P/E<55; Cyclicals P/E<10. Excludes current holdings._\n",
+        f"FMCG P/E<80; Tech P/E<55; Cyclicals P/E<10. Excludes current holdings. "
+        f"Wide capture mode: up to {_SCREEN_SIZE_PER_CATEGORY} names per sub-screen before the forward-risk gate and AI ranking._\n",
     ]
 
     for cat_id, cat_name, cap_floor in category_specs:
@@ -1701,6 +2621,7 @@ def _screen_nse_candidates(exclude_tickers: set) -> str:
                 if sym and sym not in exclude_tickers and sym not in seen:
                     seen.add(sym)
                     cat_candidates.append((q, sector_label))
+                    all_quotes[sym] = q
 
         sections.append(f"\n### Category {cat_id} — {cat_name}")
         sub_criteria = " | ".join(
@@ -1724,7 +2645,7 @@ def _screen_nse_candidates(exclude_tickers: set) -> str:
         "OR solves a specific portfolio weakness. Suggest exact share count and entry price zone.\n"
     )
 
-    return "\n".join(sections)
+    return "\n".join(sections), all_quotes
 
 
 # ──────────────────────────────────────────────
@@ -1838,7 +2759,7 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
     sections: List[str]  = [
         "## Screened Candidates — Large & Upper Mid-Cap NSE Stocks (≥₹8,000 Cr)\n",
         "_NSE-listed, market cap ≥₹8,000 Cr. Sector-appropriate P/E thresholds applied. "
-        "AI must validate further before recommending._\n",
+        f"AI must validate further before recommending. Wide capture mode: up to {_SCREEN_SIZE_PER_CATEGORY} names per sub-screen before the forward-risk gate._\n",
     ]
 
     for cat_id, cat_name in category_specs:
@@ -1891,19 +2812,12 @@ def run_fresh_portfolio_analysis(
     if not screened_quotes:
         return None, None, "📭 No candidates returned from screener — yfinance screen may be unavailable. Try again later."
 
-    # Fetch deep fundamentals + Screener.in for each candidate
-    ticker_data: Dict[str, Dict] = {}
-    for sym in sorted(screened_quotes):
-        ticker_data[sym] = _fetch_ticker_data(sym)
-        logger.info(
-            "Fetched %s — CMP: %s | Revenue CAGR 3Y: %s%% | Flags: %d",
-            sym,
-            ticker_data[sym].get("cmp"),
-            ticker_data[sym].get("revenue_cagr_3y_pct"),
-            len(ticker_data[sym].get("forensic_flags") or []),
-        )
+    eligible_quotes, ticker_data, candidate_gate_section, candidate_rows = _evaluate_screened_candidates(screened_quotes)
+    if not eligible_quotes:
+        return None, None, "📭 Candidates were screened, but all were rejected by the forward-risk and event gate. Review the watchlist manually or widen the search universe."
 
     market_data = _build_market_data_section(ticker_data)
+    candidate_forward_outlook = _build_candidate_forward_outlook_section(candidate_rows)
 
     risk       = prefs.get("risk_appetite", "Moderate")
     horizon    = prefs.get("horizon", "Long >5yr")
@@ -1962,12 +2876,15 @@ def run_fresh_portfolio_analysis(
                           "- Acceptable to pay fair value for exceptional businesses.\n",
         }.get(horizon, "")
         + f"\n{candidates_section}\n\n"
+        + f"{candidate_gate_section}\n\n"
+        + f"{candidate_forward_outlook}\n\n"
         f"{market_data}\n\n"
         "---\n"
         "Using the screened candidates and their fundamental data above, construct the optimal "
         "portfolio following the required output structure (Sections 1–5). "
         "Strictly respect the investor preferences above. "
-        "Allocate exact share counts at current CMP. Justify every inclusion and rejection."
+        "Allocate exact share counts at current CMP. Justify every inclusion and rejection. "
+        "Do not recommend any stock outside the Eligible list. Watchlist names may only be discussed as deferred ideas, not included in the final portfolio."
     )
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -2132,22 +3049,18 @@ def _fetch_screener_data(ticker: str) -> Dict:
 # Main entry point
 # ──────────────────────────────────────────────
 
-def run_rebalance_analysis(transactions_model) -> str:
-    """
-    Full Graham-style rebalance analysis across all portfolios.
-    Returns a formatted report string for Telegram delivery.
-    """
-    logger.info("Starting rebalance analysis — model: %s", _REBALANCE_MODEL)
-
+def prepare_rebalance_analysis(transactions_model) -> Dict[str, Any]:
+    """Build rebalance input prompt and write it to disk, without calling the LLM."""
+    logger.info("Preparing rebalance analysis — model: %s", _REBALANCE_MODEL)
     transactions = transactions_model.list()
     if not transactions:
-        return None, None, "📭 No portfolio transactions found — nothing to analyse."
+        return {"error": "📭 No portfolio transactions found — nothing to analyse."}
 
     positions_by_portfolio = _compute_positions_by_portfolio(transactions)
     cash_by_portfolio      = _compute_cash_by_portfolio(transactions)
 
     if not positions_by_portfolio:
-        return None, None, "📭 No active (open) positions found."
+        return {"error": "📭 No active (open) positions found."}
 
     all_tickers = {
         tk
@@ -2188,11 +3101,24 @@ def run_rebalance_analysis(transactions_model) -> str:
     sector_allocation  = _build_sector_allocation(positions_by_portfolio, ticker_data, total_current, cash_by_portfolio)
     market_data        = _build_market_data_section(ticker_data)
     recent_tx_review   = _build_recent_transaction_review(positions_by_portfolio, today)
+    notes_context      = _build_position_notes_section(positions_by_portfolio)
     instructions       = _build_analytical_instructions(positions_by_portfolio, today, cash_by_portfolio)
 
     logger.info("Screening NSE candidates for new ENTER actions...")
-    candidates_section = _screen_nse_candidates(all_tickers)
-    logger.info("NSE screening complete.")
+    candidates_section, screened_quotes = _screen_nse_candidates(all_tickers)
+    eligible_quotes, candidate_ticker_data, candidate_gate_section, candidate_rows = _evaluate_screened_candidates(screened_quotes)
+    logger.info(
+        "NSE screening complete. Eligible: %d / %d",
+        len(eligible_quotes),
+        len(screened_quotes),
+    )
+    candidate_market_data = (
+        _build_market_data_section(candidate_ticker_data)
+        if candidate_ticker_data else
+        "## Candidate Deep-Dive\n_No screened candidates passed the forward-risk and event gate._\n"
+    )
+    forward_outlook = _build_forward_outlook_section(positions_by_portfolio, ticker_data)
+    candidate_forward_outlook = _build_candidate_forward_outlook_section(candidate_rows)
 
     total_cash = sum(cash_by_portfolio.values())
     user_message = (
@@ -2210,8 +3136,15 @@ def run_rebalance_analysis(transactions_model) -> str:
         f"{duplicate_table}\n"
         f"{sizing_violations}\n"
         f"{recent_tx_review}\n"
+        f"{notes_context}\n"
+        f"{forward_outlook}\n"
         f"{market_data}\n"
         f"{candidates_section}\n"
+        f"{candidate_gate_section}\n"
+        f"{candidate_forward_outlook}\n"
+        f"{candidate_market_data}\n"
+        "Only candidates in the Eligible section may be recommended as ENTER actions. "
+        "Watchlist names may be mentioned as monitor-only; Rejected names must not be recommended.\n"
         f"{instructions}"
     )
 
@@ -2238,6 +3171,23 @@ def run_rebalance_analysis(transactions_model) -> str:
     input_tmp.flush()
     input_tmp.close()
     logger.info("Input prompt written to: %s", input_tmp.name)
+
+    return {
+        "input_path": input_tmp.name,
+        "input_md": input_md,
+        "user_message": user_message,
+        "timestamp": timestamp,
+        "total_invested": total_invested,
+        "total_current": total_current,
+    }
+
+
+def execute_rebalance_analysis(prepared: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Run the LLM for an already prepared rebalance request."""
+    user_message = prepared["user_message"]
+    timestamp = prepared["timestamp"]
+    total_invested = prepared["total_invested"]
+    total_current = prepared["total_current"]
 
     try:
         response = openai_model.chat.completions.create(
@@ -2287,9 +3237,20 @@ def run_rebalance_analysis(transactions_model) -> str:
             f"Est. cost:     ${cost_usd:.4f} USD  (~₹{cost_inr:.2f})\n"
             f"Pricing used:  ${_PRICE_INPUT_PER_1M}/1M in · ${_PRICE_OUTPUT_PER_1M}/1M out"
         )
-        return report_tmp.name, input_tmp.name, usage_msg
+        return report_tmp.name, usage_msg
 
     except Exception as e:
         logger.error("OpenAI rebalance call failed: %s", e, exc_info=True)
-        # Still return the input file so the user can inspect what was sent
-        return None, input_tmp.name, f"❌ Rebalance analysis failed: {e}"
+        return None, f"❌ Rebalance analysis failed: {e}"
+
+
+def run_rebalance_analysis(transactions_model) -> str:
+    """
+    Full Graham-style rebalance analysis across all portfolios.
+    Returns (report_path, input_path, usage_msg).
+    """
+    prepared = prepare_rebalance_analysis(transactions_model)
+    if prepared.get("error"):
+        return None, None, prepared["error"]
+    report_path, usage_msg = execute_rebalance_analysis(prepared)
+    return report_path, prepared["input_path"], usage_msg
