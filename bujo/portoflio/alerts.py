@@ -45,10 +45,15 @@ def _compute_open_positions(transactions: List[Dict]) -> Dict[str, Dict]:
                 "buy_cost": 0.0,
                 "cmp": 0.0,
                 "buy_dates": [],
+                "note": "",
             }
 
         if cmp:
             data[ticker]["cmp"] = cmp
+
+        note = (tx.get("Note") or "").strip()
+        if note:
+            data[ticker]["note"] = note
 
         if tx_type == "Buy":
             data[ticker]["total_bought"] += shares
@@ -74,6 +79,7 @@ def _compute_open_positions(transactions: List[Dict]) -> Dict[str, Dict]:
             "avg_cost": avg_cost,
             "cmp": d["cmp"],
             "oldest_buy_date": min(d["buy_dates"]) if d["buy_dates"] else None,
+            "note": d.get("note", ""),
         }
 
     return open_positions
@@ -274,6 +280,57 @@ def _classify_news(
     return []
 
 
+def _check_thesis_note(
+    company_name: str,
+    ticker: str,
+    note: str,
+    news_items: List[Dict],
+) -> List[str]:
+    """Use LLM to evaluate whether thesis exit/trim conditions are triggered."""
+    if not note.strip():
+        return []
+
+    headlines = (
+        "\n".join(f"- {n['title']}" for n in news_items)
+        if news_items
+        else "No recent news headlines available."
+    )
+    prompt = (
+        f"You are a financial analyst evaluating exit and trim conditions for an investor "
+        f"holding {company_name} ({ticker}).\n\n"
+        "Investment thesis / exit conditions:\n"
+        f"{note}\n\n"
+        f"Recent news headlines (last 48 hours):\n{headlines}\n\n"
+        "Using the news above and your general knowledge of recent events, identify which "
+        "conditions (if any) appear to be triggered or clearly at risk right now.\n\n"
+        "Be conservative — only flag a condition if there is concrete evidence from the "
+        "headlines or well-known recent events. Do not speculate.\n\n"
+        "Return ONLY a JSON array:\n"
+        '[{"condition": "exact phrase from the thesis", "evidence": "one-line explanation"}]\n'
+        "If no conditions are triggered, return []."
+    )
+
+    try:
+        resp = openai_model.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=600,
+        )
+        raw = resp.choices[0].message.content.strip()
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if match:
+            items = json.loads(match.group())
+            return [
+                f"📋 *Thesis alert*: {it['condition']}\n   _{it.get('evidence', '')}_"
+                for it in items
+                if it.get("condition")
+            ]
+    except Exception as e:
+        logger.warning("Thesis note check failed for %s: %s", ticker, e)
+
+    return []
+
+
 def run_portfolio_alerts(transactions_model) -> str:
     """
     Run all alert checks across open positions.
@@ -307,6 +364,9 @@ def run_portfolio_alerts(transactions_model) -> str:
 
         news_items = _fetch_news(company_name, ticker)
         ticker_alerts.extend(_classify_news(company_name, ticker, news_items))
+        ticker_alerts.extend(
+            _check_thesis_note(company_name, ticker, position.get("note", ""), news_items)
+        )
 
         if ticker_alerts:
             all_alerts[ticker] = ticker_alerts

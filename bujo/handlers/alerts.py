@@ -79,6 +79,8 @@ async def price_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
 
+    chat_id = query.message.chat_id
+
     if data.startswith("pal_done_"):
         await _try_delete()
 
@@ -86,15 +88,18 @@ async def price_alert_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         alert_id = int(data.split("_")[-1])
         _alert_modify_pending[query.from_user.id] = alert_id
         await _try_delete()
-        await query.message.reply_text(
-            "✏️ Send the new target price (just a number, e.g. `1250.50`):",
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="✏️ Send the new target price (just a number, e.g. `1250.50`):",
             parse_mode="Markdown",
         )
 
     elif data.startswith("pal_cancel_"):
         alert_id = int(data.split("_")[-1])
-        ok = price_alerts_model.deactivate(alert_id)
+        ok = price_alerts_model.delete(alert_id)
         _alert_modify_pending.pop(query.from_user.id, None)
         await _try_delete()
-        if not ok:
-            await query.message.reply_text("❌ Failed to cancel alert.")
+        if ok:
+            await context.bot.send_message(chat_id=chat_id, text="✅ Alert cancelled.")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Failed to cancel alert.")

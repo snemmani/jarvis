@@ -32,8 +32,8 @@ class BaseNocoDB:
         logger.error("Read failed: %s %s", response.status_code, response.text)
         return None
 
-    def delete(self, record_id: str) -> bool:
-        response = requests.delete(self._url(f"/{record_id}"), headers=self.headers)
+    def delete(self, record_id) -> bool:
+        response = requests.delete(self._url(), json=[{"Id": record_id}], headers=self.headers)
         if response.ok:
             return True
         logger.error("Delete failed: %s %s", response.status_code, response.text)

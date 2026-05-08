@@ -32,6 +32,8 @@ sys.modules["langgraph.prebuilt"] = fake_prebuilt
 
 from bujo.portoflio.rebalance import (
     _compute_valuation_profile,
+    _normalize_percent_value,
+    _render_screener_table,
     _select_valuation_method,
     _summarize_forward_outlook,
 )
@@ -138,6 +140,25 @@ class TestRebalanceForwardOutlook(unittest.TestCase):
         valuation = _compute_valuation_profile(td)
         self.assertEqual(valuation["primary"]["method"], "P/B-ROE")
         self.assertEqual(valuation["reverse"]["method"], "Reverse P/B-ROE")
+
+    def test_normalizes_dividend_yield_percentages(self):
+        self.assertEqual(_normalize_percent_value(0.025), 2.5)
+        self.assertEqual(_normalize_percent_value(2.5), 2.5)
+
+    def test_screener_table_separates_sector_and_rule_columns(self):
+        table = _render_screener_table([
+            ({
+                "symbol": "TEST",
+                "shortName": "Test Co",
+                "regularMarketPrice": 100,
+                "marketCap": 10000000000,
+                "dividendYield": 0.015,
+            }, "Technology", "P/E<55 · ROE>15%"),
+        ])
+        self.assertIn("Sector Bucket", table[0])
+        self.assertIn("Rule Snapshot", table[0])
+        self.assertIn("Technology", table[2])
+        self.assertIn("P/E<55", table[2])
 
 
 if __name__ == "__main__":

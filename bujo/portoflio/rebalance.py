@@ -411,6 +411,49 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _normalize_percent_value(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if abs(num) <= 1:
+        num *= 100
+    return round(num, 2)
+
+
+def _cr_value(raw: Any, fx_rate: float) -> Optional[float]:
+    if raw in (None, ""):
+        return None
+    try:
+        return round(float(raw) * fx_rate / 1e7, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_num(value: Any, decimals: int = 2, prefix: str = "", suffix: str = "") -> str:
+    if value is None:
+        return "Insufficient evidence"
+    try:
+        return f"{prefix}{float(value):,.{decimals}f}{suffix}"
+    except (TypeError, ValueError):
+        return "Insufficient evidence"
+
+
+def _fmt_pct(value: Any, decimals: int = 1) -> str:
+    return _fmt_num(value, decimals=decimals, suffix="%")
+
+
+def _fmt_ratio(value: Any, decimals: int = 2, suffix: str = "x") -> str:
+    return _fmt_num(value, decimals=decimals, suffix=suffix)
+
+
+def _fmt_text(value: Any) -> str:
+    text = str(value).strip() if value not in (None, "") else ""
+    return text or "Insufficient evidence"
+
+
 def _classify_holding_period(days: int) -> str:
     if days <= _HP_VERY_RECENT:
         return "Very Recent (0–30 days)"
@@ -677,13 +720,13 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "exchange":        info.get("exchange", "N/A"),
             "currency":        currency,
             "fx_rate_to_inr":  fx_rate,
-            "cmp_native":      cmp_native,
-            "market_cap_cr":   round((info.get("marketCap") or 0) * fx_rate / 1e7, 2),
-            "cmp":             round(cmp_native * fx_rate, 4) if cmp_native else 0,
-            "52w_high":        (info.get("fiftyTwoWeekHigh") or 0) * fx_rate or None,
-            "52w_low":         (info.get("fiftyTwoWeekLow") or 0) * fx_rate or None,
-            "50d_ma":          (info.get("fiftyDayAverage") or 0) * fx_rate or None,
-            "200d_ma":         (info.get("twoHundredDayAverage") or 0) * fx_rate or None,
+            "cmp_native":      round(cmp_native, 4) if cmp_native else None,
+            "market_cap_cr":   _cr_value(info.get("marketCap"), fx_rate),
+            "cmp":             round(cmp_native * fx_rate, 4) if cmp_native else None,
+            "52w_high":        round(float(info.get("fiftyTwoWeekHigh")) * fx_rate, 4) if info.get("fiftyTwoWeekHigh") not in (None, "") else None,
+            "52w_low":         round(float(info.get("fiftyTwoWeekLow")) * fx_rate, 4) if info.get("fiftyTwoWeekLow") not in (None, "") else None,
+            "50d_ma":          round(float(info.get("fiftyDayAverage")) * fx_rate, 4) if info.get("fiftyDayAverage") not in (None, "") else None,
+            "200d_ma":         round(float(info.get("twoHundredDayAverage")) * fx_rate, 4) if info.get("twoHundredDayAverage") not in (None, "") else None,
             "beta":            info.get("beta"),
             "avg_volume":      info.get("averageVolume"),
         }
@@ -697,9 +740,9 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "ev_ebitda":     info.get("enterpriseToEbitda"),
             "ev_revenue":    info.get("enterpriseToRevenue"),
             "peg":           info.get("pegRatio"),
-            "book_value":    round((info.get("bookValue") or 0) * fx_rate, 4) or None,
-            "eps_ttm":       round((info.get("trailingEps") or 0) * fx_rate, 4) or None,
-            "eps_forward":   round((info.get("forwardEps") or 0) * fx_rate, 4) or None,
+            "book_value":    round(float(info.get("bookValue")) * fx_rate, 4) if info.get("bookValue") not in (None, "") else None,
+            "eps_ttm":       round(float(info.get("trailingEps")) * fx_rate, 4) if info.get("trailingEps") not in (None, "") else None,
+            "eps_forward":   round(float(info.get("forwardEps")) * fx_rate, 4) if info.get("forwardEps") not in (None, "") else None,
         })
 
         # ── Profitability & quality (Part E + Part F) ──
@@ -720,9 +763,9 @@ def _fetch_ticker_data(ticker: str) -> Dict:
 
         # ── Dividend (Part A, value anchor / income role) ──
         d.update({
-            "dividend_yield":  _pct(info.get("dividendYield")),
-            "dividend_rate":   round((info.get("dividendRate") or 0) * fx_rate, 4) or None,
-            "payout_ratio":    _pct(info.get("payoutRatio")),
+            "dividend_yield":  _normalize_percent_value(info.get("dividendYield")),
+            "dividend_rate":   round(float(info.get("dividendRate")) * fx_rate, 4) if info.get("dividendRate") not in (None, "") else None,
+            "payout_ratio":    _normalize_percent_value(info.get("payoutRatio")),
         })
 
         # ── Balance sheet strength (Part E – Shenanigans + Part F – sector rules) ──
@@ -734,10 +777,10 @@ def _fetch_ticker_data(ticker: str) -> Dict:
             "debt_to_equity":    info.get("debtToEquity"),
             "current_ratio":     info.get("currentRatio"),
             "quick_ratio":       info.get("quickRatio"),
-            "total_debt_cr":     round(total_debt * fx_rate / 1e7, 2),
-            "cash_cr":           round(total_cash * fx_rate / 1e7, 2),
-            "net_debt_cr":       round((total_debt - total_cash) * fx_rate / 1e7, 2),
-            "total_revenue_cr":  round(total_revenue * fx_rate / 1e7, 2),
+            "total_debt_cr":     _cr_value(total_debt, fx_rate),
+            "cash_cr":           _cr_value(total_cash, fx_rate),
+            "net_debt_cr":       _cr_value((total_debt - total_cash), fx_rate) if total_debt or total_cash else None,
+            "total_revenue_cr":  _cr_value(total_revenue, fx_rate),
             "net_debt_to_ebitda": _safe_div(
                 total_debt - total_cash,
                 info.get("ebitda") or 0,
@@ -748,20 +791,20 @@ def _fetch_ticker_data(ticker: str) -> Dict:
         ocf = info.get("operatingCashflow") or 0
         fcf = info.get("freeCashflow") or 0
         d.update({
-            "operating_cashflow_cr": round(ocf * fx_rate / 1e7, 2),
-            "free_cash_flow_cr":     round(fcf * fx_rate / 1e7, 2),
+            "operating_cashflow_cr": _cr_value(ocf, fx_rate),
+            "free_cash_flow_cr":     _cr_value(fcf, fx_rate),
             "fcf_yield_pct":         _pct(_safe_div(fcf, market_cap)),
-            "capex_cr":              round(((ocf - fcf) if ocf and fcf else 0) * fx_rate / 1e7, 2),
+            "capex_cr":              _cr_value((ocf - fcf), fx_rate) if ocf not in (None, 0) and fcf not in (None, 0) else None,
         })
 
         # ── Ownership & governance (Part E) ──
         d.update({
-            "insider_ownership_pct":       _pct(info.get("heldPercentInsiders")),
-            "institutional_ownership_pct": _pct(info.get("heldPercentInstitutions")),
-            "shares_outstanding_cr":       round((info.get("sharesOutstanding") or 0) / 1e7, 4),
-            "float_shares_cr":             round((info.get("floatShares") or 0) / 1e7, 4),
+            "insider_ownership_pct":       _normalize_percent_value(info.get("heldPercentInsiders")),
+            "institutional_ownership_pct": _normalize_percent_value(info.get("heldPercentInstitutions")),
+            "shares_outstanding_cr":       round(float(info.get("sharesOutstanding")) / 1e7, 4) if info.get("sharesOutstanding") not in (None, "") else None,
+            "float_shares_cr":             round(float(info.get("floatShares")) / 1e7, 4) if info.get("floatShares") not in (None, "") else None,
             "short_ratio":                 info.get("shortRatio"),
-            "shares_short_pct_float":      _pct(info.get("shortPercentOfFloat")),
+            "shares_short_pct_float":      _normalize_percent_value(info.get("shortPercentOfFloat")),
         })
 
         # ── Sector-specific extras (Part F) ──
@@ -1711,6 +1754,78 @@ def _build_position_notes_section(
     return "\n".join(lines)
 
 
+def _build_reconciliation_checks(transactions: List[Dict[str, Any]]) -> str:
+    lines: List[str] = ["## Data Reconciliation Checks\n"]
+    cash_rows = []
+    trade_rows = []
+    for tx in transactions:
+        ticker = (tx.get("Ticker") or "").strip().upper()
+        if ticker == _CASH_TICKER:
+            cash_rows.append({
+                "portfolio": (tx.get("Portfolio") or "Default").strip(),
+                "date": (tx.get("Date") or "")[:10],
+                "type": (tx.get("TransactionType") or "").strip(),
+                "amount": round(float(tx.get("NoOfShares") or 0) * float(tx.get("CostPerShare") or 0), 2),
+                "used": False,
+            })
+        elif ticker:
+            tx_type = (tx.get("TransactionType") or "").strip()
+            if tx_type not in {"Buy", "Sell"}:
+                continue
+            trade_rows.append({
+                "ticker": ticker,
+                "portfolio": (tx.get("Portfolio") or "Default").strip(),
+                "date": (tx.get("Date") or "")[:10],
+                "cash_type": "Withdraw" if tx_type == "Buy" else "Deposit",
+                "amount": round(float(tx.get("NoOfShares") or 0) * float(tx.get("CostPerShare") or 0), 2),
+            })
+
+    missing_matches: List[str] = []
+    for trade in trade_rows:
+        matched = False
+        for cash in cash_rows:
+            if cash["used"]:
+                continue
+            if (
+                cash["portfolio"] == trade["portfolio"]
+                and cash["date"] == trade["date"]
+                and cash["type"] in {trade["cash_type"], "Withdrawal" if trade["cash_type"] == "Withdraw" else trade["cash_type"]}
+                and math.isclose(cash["amount"], trade["amount"], rel_tol=0.0, abs_tol=0.5)
+            ):
+                cash["used"] = True
+                matched = True
+                break
+        if not matched:
+            missing_matches.append(
+                f"{trade['portfolio']} {trade['date']} {trade['ticker']} requires {trade['cash_type']} ₹{trade['amount']:,.2f}"
+            )
+
+    unmatched_cash = [
+        c for c in cash_rows
+        if not c["used"] and c["type"] in {"Deposit", "Withdraw", "Withdrawal"}
+    ]
+
+    if missing_matches:
+        lines.append("### Missing Trade-Cash Matches")
+        for item in missing_matches[:10]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- All Buy/Sell rows have matching CASH entries within tolerance.")
+
+    if unmatched_cash:
+        lines.append("\n### Unmatched CASH Rows")
+        for cash in unmatched_cash[:10]:
+            lines.append(
+                f"- {cash['portfolio']} {cash['date']} {cash['type']} ₹{cash['amount']:,.2f} "
+                "(may be external funding, or may need manual review)"
+            )
+    else:
+        lines.append("\n- No unmatched CASH rows detected.")
+
+    lines.append("\nIf a metric is missing or inconsistent, state `Insufficient evidence` instead of inferring or inventing it.\n")
+    return "\n".join(lines)
+
+
 def _build_duplicate_exposure_table(
     positions_by_portfolio: Dict[str, Dict[str, Dict]],
     ticker_data: Dict[str, Dict],
@@ -1876,7 +1991,7 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
         lines.append(f"**Sector Bucket:** {td.get('sector_bucket')} | "
                      f"**Exchange:** {td.get('exchange')} | "
                      f"**Industry:** {td.get('industry')}{fx_note}")
-        lines.append(f"**Business:** {td.get('business_summary', 'N/A')}")
+        lines.append(f"**Business:** {_fmt_text(td.get('business_summary'))}")
         lines.append("")
 
         valuation = td.get("valuation") or {}
@@ -1884,179 +1999,170 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
         reverse = valuation.get("reverse") or {}
         lines.append("**Valuation Engine:**")
         lines.append(
-            f"- Method: {valuation.get('primary_method', 'N/A')} | Verdict: {valuation.get('verdict', 'N/A')} | Confidence: {valuation.get('confidence', 'Low')}"
+            f"- Method: {_fmt_text(valuation.get('primary_method'))} | Verdict: {_fmt_text(valuation.get('verdict'))} | Confidence: {_fmt_text(valuation.get('confidence'))}"
         )
         if primary.get("method") == "DCF" and primary.get("applicable"):
             per_share = primary.get("per_share") or {}
             lines.append(
-                f"- DCF per-share value — Bear ₹{per_share.get('bear')} | Base ₹{per_share.get('base')} | Bull ₹{per_share.get('bull')} | "
-                f"Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+                f"- DCF per-share value — Bear {_fmt_num(per_share.get('bear'), prefix='₹')} | Base {_fmt_num(per_share.get('base'), prefix='₹')} | Bull {_fmt_num(per_share.get('bull'), prefix='₹')} | "
+                f"Margin of Safety: {_fmt_pct(primary.get('margin_of_safety_pct'))}"
             )
             lines.append(
-                f"- DCF assumptions — Cost of Equity {primary.get('cost_of_equity_pct')}% | "
-                f"Initial Growth {primary.get('initial_growth_pct')}% | Terminal Growth {primary.get('terminal_growth_pct')}%"
+                f"- DCF assumptions — Cost of Equity {_fmt_pct(primary.get('cost_of_equity_pct'))} | "
+                f"Initial Growth {_fmt_pct(primary.get('initial_growth_pct'))} | Terminal Growth {_fmt_pct(primary.get('terminal_growth_pct'))}"
             )
         elif primary.get("method") == "P/B-ROE" and primary.get("applicable"):
             lines.append(
-                f"- Fair value/share ₹{primary.get('fair_value_per_share')} | Justified P/B {primary.get('justified_pb')} | "
-                f"Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+                f"- Fair value/share {_fmt_num(primary.get('fair_value_per_share'), prefix='₹')} | Justified P/B {_fmt_text(primary.get('justified_pb'))} | "
+                f"Margin of Safety: {_fmt_pct(primary.get('margin_of_safety_pct'))}"
             )
             lines.append(
-                f"- P/B-ROE inputs — Cost of Equity {primary.get('cost_of_equity_pct')}% | "
-                f"Sustainable Growth {primary.get('growth_pct')}% | Implied Sustainable ROE at current P/B {primary.get('implied_sustainable_roe_pct')}%"
+                f"- P/B-ROE inputs — Cost of Equity {_fmt_pct(primary.get('cost_of_equity_pct'))} | "
+                f"Sustainable Growth {_fmt_pct(primary.get('growth_pct'))} | Implied Sustainable ROE at current P/B {_fmt_pct(primary.get('implied_sustainable_roe_pct'))}"
             )
         elif primary.get("method") == "Normalized P/E" and primary.get("applicable"):
             lines.append(
-                f"- Fair value/share ₹{primary.get('fair_value_per_share')} | Fair P/E {primary.get('fair_pe')}x | "
-                f"Normalized EPS ₹{primary.get('normalized_eps')} | Margin of Safety: {primary.get('margin_of_safety_pct')}%"
+                f"- Fair value/share {_fmt_num(primary.get('fair_value_per_share'), prefix='₹')} | Fair P/E {_fmt_text(primary.get('fair_pe'))}x | "
+                f"Normalized EPS {_fmt_num(primary.get('normalized_eps'), prefix='₹')} | Margin of Safety: {_fmt_pct(primary.get('margin_of_safety_pct'))}"
             )
             lines.append(
-                f"- Earnings yield at CMP: {primary.get('current_earnings_yield_pct')}%"
+                f"- Earnings yield at CMP: {_fmt_pct(primary.get('current_earnings_yield_pct'))}"
             )
         else:
-            lines.append(f"- Primary valuation unavailable: {primary.get('reason', 'Missing inputs')}")
+            lines.append(f"- Primary valuation unavailable: {_fmt_text(primary.get('reason'))}")
 
         if reverse.get("applicable"):
             if reverse.get("method") == "Reverse DCF":
                 lines.append(
-                    f"- Reverse DCF: CMP implies ~{reverse.get('implied_fcf_growth_5y_pct')}% 5Y FCF growth "
-                    f"(CoE {reverse.get('cost_of_equity_pct')}%, terminal growth {reverse.get('terminal_growth_pct')}%)"
+                    f"- Reverse DCF: CMP implies ~{_fmt_pct(reverse.get('implied_fcf_growth_5y_pct'))} 5Y FCF growth "
+                    f"(CoE {_fmt_pct(reverse.get('cost_of_equity_pct'))}, terminal growth {_fmt_pct(reverse.get('terminal_growth_pct'))})"
                 )
             elif reverse.get("method") == "Reverse P/B-ROE":
                 lines.append(
-                    f"- Reverse valuation: current P/B implies sustainable ROE of ~{reverse.get('implied_sustainable_roe_pct')}%"
+                    f"- Reverse valuation: current P/B implies sustainable ROE of ~{_fmt_pct(reverse.get('implied_sustainable_roe_pct'))}"
                 )
         else:
-            lines.append(f"- Reverse valuation unavailable: {reverse.get('reason', 'Missing inputs')}")
+            lines.append(f"- Reverse valuation unavailable: {_fmt_text(reverse.get('reason'))}")
 
-        # Valuation (Part F + G)
         lines.append("**Valuation Multiples:**")
         lines.append(
-            f"- P/E TTM: {td.get('pe_ttm')} | P/E Fwd: {td.get('pe_forward')} | "
-            f"P/B: {td.get('pb')} | P/S: {td.get('ps')} | EV/EBITDA: {td.get('ev_ebitda')} | PEG: {td.get('peg')}"
+            f"- P/E TTM: {_fmt_text(td.get('pe_ttm'))} | P/E Fwd: {_fmt_text(td.get('pe_forward'))} | "
+            f"P/B: {_fmt_text(td.get('pb'))} | P/S: {_fmt_text(td.get('ps'))} | EV/EBITDA: {_fmt_text(td.get('ev_ebitda'))} | PEG: {_fmt_text(td.get('peg'))}"
         )
         lines.append(
-            f"- Book Value/Share: ₹{td.get('book_value')} | EPS TTM: ₹{td.get('eps_ttm')} | EPS Fwd: ₹{td.get('eps_forward')}"
+            f"- Book Value/Share: {_fmt_num(td.get('book_value'), prefix='₹')} | EPS TTM: {_fmt_num(td.get('eps_ttm'), prefix='₹')} | EPS Fwd: {_fmt_num(td.get('eps_forward'), prefix='₹')}"
         )
         lines.append(
-            f"- Market Cap: ₹{td.get('market_cap_cr')} Cr | FCF Yield: {td.get('fcf_yield_pct')}%"
+            f"- Market Cap: {_fmt_num(td.get('market_cap_cr'), prefix='₹', suffix=' Cr')} | FCF Yield: {_fmt_pct(td.get('fcf_yield_pct'))}"
         )
         lines.append(
-            f"- 52W High: ₹{td.get('52w_high')} | 52W Low: ₹{td.get('52w_low')} | "
-            f"CMP vs 52W High: {round((td.get('cmp',0) / td.get('52w_high',1) - 1) * 100, 1) if td.get('52w_high') else 'N/A'}% | "
-            f"CMP vs 52W Low: {round((td.get('cmp',0) / td.get('52w_low',1) - 1) * 100, 1) if td.get('52w_low') else 'N/A'}%"
+            f"- 52W High: {_fmt_num(td.get('52w_high'), prefix='₹')} | 52W Low: {_fmt_num(td.get('52w_low'), prefix='₹')} | "
+            f"CMP vs 52W High: {_fmt_pct(round((td.get('cmp') / td.get('52w_high') - 1) * 100, 1) if td.get('cmp') and td.get('52w_high') else None)} | "
+            f"CMP vs 52W Low: {_fmt_pct(round((td.get('cmp') / td.get('52w_low') - 1) * 100, 1) if td.get('cmp') and td.get('52w_low') else None)}"
         )
         lines.append(
-            f"- 50D MA: ₹{td.get('50d_ma')} | 200D MA: ₹{td.get('200d_ma')} | Beta: {td.get('beta')}"
+            f"- 50D MA: {_fmt_num(td.get('50d_ma'), prefix='₹')} | 200D MA: {_fmt_num(td.get('200d_ma'), prefix='₹')} | Beta: {_fmt_text(td.get('beta'))}"
         )
 
-        # Profitability (Part D, F, G)
         lines.append("\n**Profitability & Returns:**")
         lines.append(
-            f"- ROE: {td.get('roe')}% | ROA: {td.get('roa')}%"
+            f"- ROE: {_fmt_pct(td.get('roe'))} | ROA: {_fmt_pct(td.get('roa'))}"
         )
         lines.append(
-            f"- Profit Margin: {td.get('profit_margin')}% | Operating Margin: {td.get('operating_margin')}% | "
-            f"Gross Margin: {td.get('gross_margin')}% | EBITDA Margin: {td.get('ebitda_margin')}%"
+            f"- Profit Margin: {_fmt_pct(td.get('profit_margin'))} | Operating Margin: {_fmt_pct(td.get('operating_margin'))} | "
+            f"Gross Margin: {_fmt_pct(td.get('gross_margin'))} | EBITDA Margin: {_fmt_pct(td.get('ebitda_margin'))}"
         )
         lines.append(
-            f"- FCF Margin: {td.get('fcf_margin_pct')}% | Interest Coverage: {td.get('interest_coverage')}x"
+            f"- FCF Margin: {_fmt_pct(td.get('fcf_margin_pct'))} | Interest Coverage: {_fmt_ratio(td.get('interest_coverage'))}"
         )
 
-        # Growth (Part D – GARP)
         lines.append("\n**Growth Profile (GARP Criteria):**")
         lines.append(
-            f"- Revenue YoY: {td.get('revenue_growth_yoy')}% | Earnings YoY: {td.get('earnings_growth_yoy')}%"
+            f"- Revenue YoY: {_fmt_pct(td.get('revenue_growth_yoy'))} | Earnings YoY: {_fmt_pct(td.get('earnings_growth_yoy'))}"
         )
         lines.append(
-            f"- Forward EPS vs TTM EPS: ₹{td.get('eps_forward')} vs ₹{td.get('eps_ttm')} | "
-            f"Forward P/E vs TTM P/E: {td.get('pe_forward')} vs {td.get('pe_ttm')}"
+            f"- Forward EPS vs TTM EPS: {_fmt_num(td.get('eps_forward'), prefix='₹')} vs {_fmt_num(td.get('eps_ttm'), prefix='₹')} | "
+            f"Forward P/E vs TTM P/E: {_fmt_text(td.get('pe_forward'))} vs {_fmt_text(td.get('pe_ttm'))}"
         )
         lines.append(
-            f"- Revenue CAGR 3Y: {td.get('revenue_cagr_3y_pct')}% | 5Y: {td.get('revenue_cagr_5y_pct')}%"
+            f"- Revenue CAGR 3Y: {_fmt_pct(td.get('revenue_cagr_3y_pct'))} | 5Y: {_fmt_pct(td.get('revenue_cagr_5y_pct'))}"
         )
         lines.append(
-            f"- Net Income CAGR 3Y: {td.get('net_income_cagr_3y_pct')}% | 5Y: {td.get('net_income_cagr_5y_pct')}%"
+            f"- Net Income CAGR 3Y: {_fmt_pct(td.get('net_income_cagr_3y_pct'))} | 5Y: {_fmt_pct(td.get('net_income_cagr_5y_pct'))}"
         )
         lines.append(
-            f"- Price CAGR 5Y: {td.get('price_cagr_5y_pct')}% | 1Y Price Return: {td.get('price_return_1y_pct')}%"
+            f"- Price CAGR 5Y: {_fmt_pct(td.get('price_cagr_5y_pct'))} | 1Y Price Return: {_fmt_pct(td.get('price_return_1y_pct'))}"
         )
         lines.append(
-            f"- PEG Ratio: {td.get('peg')} (GARP target: <1.5 for strong conviction)"
+            f"- PEG Ratio: {_fmt_text(td.get('peg'))} (GARP target: <1.5 for strong conviction)"
         )
 
-        # Cash flow quality (Part E – Shenanigans)
         lines.append("\n**Cash Flow Quality (Shenanigans Screen):**")
         lines.append(
-            f"- Operating CF: ₹{td.get('operating_cashflow_cr')} Cr | FCF: ₹{td.get('free_cash_flow_cr')} Cr | "
-            f"Capex: ₹{td.get('capex_cr')} Cr"
+            f"- Operating CF: {_fmt_num(td.get('operating_cashflow_cr'), prefix='₹', suffix=' Cr')} | FCF: {_fmt_num(td.get('free_cash_flow_cr'), prefix='₹', suffix=' Cr')} | "
+            f"Capex: {_fmt_num(td.get('capex_cr'), prefix='₹', suffix=' Cr')}"
         )
         lines.append(
-            f"- Cash Conversion Ratio (OCF/Net Income): {td.get('cash_conversion_ratio')} "
+            f"- Cash Conversion Ratio (OCF/Net Income): {_fmt_text(td.get('cash_conversion_ratio'))} "
             f"(≥0.8 = clean; <0.6 = serious concern)"
         )
         if td.get("annual_cashflows"):
             lines.append("- Annual Cash Flow Trend (₹ Cr):")
             for yr in td["annual_cashflows"]:
                 lines.append(
-                    f"  {yr['year']}: OCF {yr.get('operating_cash_flow')} Cr | "
-                    f"FCF {yr.get('free_cash_flow')} Cr | "
-                    f"Capex {yr.get('capital_expenditure')} Cr | "
-                    f"Net Debt Chg {yr.get('net_issuance_payments_of_debt')} Cr | "
-                    f"Dividends {yr.get('cash_dividends_paid')} Cr"
+                    f"  {yr['year']}: OCF {_fmt_text(yr.get('operating_cash_flow'))} Cr | "
+                    f"FCF {_fmt_text(yr.get('free_cash_flow'))} Cr | "
+                    f"Capex {_fmt_text(yr.get('capital_expenditure'))} Cr | "
+                    f"Net Debt Chg {_fmt_text(yr.get('net_issuance_payments_of_debt'))} Cr | "
+                    f"Dividends {_fmt_text(yr.get('cash_dividends_paid'))} Cr"
                 )
 
-        # Balance sheet (Part E + sector rules)
         lines.append("\n**Balance Sheet Strength:**")
         lines.append(
-            f"- Debt/Equity: {td.get('debt_to_equity')} | Current Ratio: {td.get('current_ratio')} | "
-            f"Quick Ratio: {td.get('quick_ratio')}"
+            f"- Debt/Equity: {_fmt_text(td.get('debt_to_equity'))} | Current Ratio: {_fmt_text(td.get('current_ratio'))} | "
+            f"Quick Ratio: {_fmt_text(td.get('quick_ratio'))}"
         )
         lines.append(
-            f"- Total Debt: ₹{td.get('total_debt_cr')} Cr | Cash: ₹{td.get('cash_cr')} Cr | "
-            f"Net Debt: ₹{td.get('net_debt_cr')} Cr | Net Debt/EBITDA: {td.get('net_debt_to_ebitda')}x"
+            f"- Total Debt: {_fmt_num(td.get('total_debt_cr'), prefix='₹', suffix=' Cr')} | Cash: {_fmt_num(td.get('cash_cr'), prefix='₹', suffix=' Cr')} | "
+            f"Net Debt: {_fmt_num(td.get('net_debt_cr'), prefix='₹', suffix=' Cr')} | Net Debt/EBITDA: {_fmt_ratio(td.get('net_debt_to_ebitda'))}"
         )
         if td.get("annual_balance_sheet"):
             lines.append("- Balance Sheet Trend (₹ Cr):")
             for yr in td["annual_balance_sheet"]:
                 lines.append(
-                    f"  {yr['year']}: Receivables {yr.get('accounts_receivable')} | "
-                    f"Inventory {yr.get('inventory')} | "
-                    f"Equity {yr.get('stockholders_equity')} | "
-                    f"LT Debt {yr.get('long_term_debt')}"
+                    f"  {yr['year']}: Receivables {_fmt_text(yr.get('accounts_receivable'))} | "
+                    f"Inventory {_fmt_text(yr.get('inventory'))} | "
+                    f"Equity {_fmt_text(yr.get('stockholders_equity'))} | "
+                    f"LT Debt {_fmt_text(yr.get('long_term_debt'))}"
                 )
 
-        # Annual P&L (Part E – 5-year trend)
         lines.append("\n**Annual P&L Trend (₹ Cr) — 5-Year History:**")
         if td.get("annual_financials"):
             for yr in td["annual_financials"]:
                 lines.append(
-                    f"  {yr['year']}: Revenue {yr.get('total_revenue')} | "
-                    f"Gross Profit {yr.get('gross_profit')} | "
-                    f"EBIT {yr.get('ebit')} | "
-                    f"Net Income {yr.get('net_income')}"
+                    f"  {yr['year']}: Revenue {_fmt_text(yr.get('total_revenue'))} | "
+                    f"Gross Profit {_fmt_text(yr.get('gross_profit'))} | "
+                    f"EBIT {_fmt_text(yr.get('ebit'))} | "
+                    f"Net Income {_fmt_text(yr.get('net_income'))}"
                 )
         else:
-            lines.append("  _Not available_")
+            lines.append("  _Insufficient evidence_")
 
-        # Dividend (income / value anchor role)
         lines.append("\n**Dividend & Shareholder Returns:**")
         lines.append(
-            f"- Dividend Yield: {td.get('dividend_yield')}% | Rate: ₹{td.get('dividend_rate')} | "
-            f"Payout Ratio: {td.get('payout_ratio')}%"
+            f"- Dividend Yield: {_fmt_pct(td.get('dividend_yield'), decimals=2)} | Rate: {_fmt_num(td.get('dividend_rate'), prefix='₹')} | "
+            f"Payout Ratio: {_fmt_pct(td.get('payout_ratio'))}"
         )
 
-        # Ownership & governance (Part E)
         lines.append("\n**Ownership & Governance:**")
         lines.append(
-            f"- Insider: {td.get('insider_ownership_pct')}% | Institutional: {td.get('institutional_ownership_pct')}%"
+            f"- Insider: {_fmt_pct(td.get('insider_ownership_pct'))} | Institutional: {_fmt_pct(td.get('institutional_ownership_pct'))}"
         )
         lines.append(
-            f"- Shares Outstanding: {td.get('shares_outstanding_cr')} Cr | "
-            f"Short Ratio: {td.get('short_ratio')} | Short % Float: {td.get('shares_short_pct_float')}%"
+            f"- Shares Outstanding: {_fmt_num(td.get('shares_outstanding_cr'), decimals=4, suffix=' Cr')} | "
+            f"Short Ratio: {_fmt_text(td.get('short_ratio'))} | Short % Float: {_fmt_pct(td.get('shares_short_pct_float'))}"
         )
 
-        # Forensic flags (Part E)
         flags = td.get("forensic_flags") or []
         lines.append("\n**Forensic Accounting Signals (Part E Screen):**")
         if flags:
@@ -2076,7 +2182,7 @@ def _build_market_data_section(ticker_data: Dict[str, Dict]) -> str:
             for c in cons:
                 lines.append(f"  ❌ {c}")
         else:
-            lines.append("\n**Screener.in:** _No data available_")
+            lines.append("\n**Screener.in:** _Insufficient evidence_")
 
         # Sector-specific note (Part F)
         bucket = td.get("sector_bucket", "")
@@ -2171,7 +2277,7 @@ def _build_candidate_forward_outlook_section(
             f"- Gate status: **{assessment.get('status', 'unknown').title()}** | Forward class: **{outlook['outlook']}** | Expected XIRR band: **{outlook['xirr_band']}**\n"
             f"- Positive evidence: {'; '.join(outlook['evidence']) if outlook['evidence'] else 'Limited hard forward positives available'}\n"
             f"- Key cautions: {'; '.join(outlook['cautions']) if outlook['cautions'] else 'No major forward caution flags from current data'}\n"
-            f"- Supporting data: Analyst rating {analyst if analyst is not None else 'N/A'} | PEG {td.get('peg')} | Revenue YoY {td.get('revenue_growth_yoy')}% | Earnings YoY {td.get('earnings_growth_yoy')}%\n"
+            f"- Supporting data: Analyst rating {_fmt_text(analyst)} | PEG {_fmt_text(td.get('peg'))} | Revenue YoY {_fmt_pct(td.get('revenue_growth_yoy'))} | Earnings YoY {_fmt_pct(td.get('earnings_growth_yoy'))}\n"
             f"- Recent headlines: {' | '.join(outlook['headlines']) if outlook['headlines'] else 'No recent high-signal headlines captured'}\n"
         )
     return "\n".join(lines)
@@ -2495,31 +2601,33 @@ def _build_sector_aware_queries(cat_id: str, cap_floor: int) -> List[Tuple[str, 
 
 
 def _render_screener_table(
-    candidates: List[Tuple[Dict, str]],  # (quote_dict, sector_label)
+    candidates: List[Tuple[Dict, str, str]],  # (quote_dict, sector_label, criteria)
 ) -> List[str]:
-    """Render a markdown table for screened candidates, including a Screen column."""
+    """Render a markdown table for screened candidates with separate sector and rule labels."""
     lines = [
-        "| Symbol | Company | Screen | CMP (₹) | Mkt Cap (₹Cr) | P/E | P/B | "
+        "| Symbol | Company | Sector Bucket | Rule Snapshot | CMP (₹) | Mkt Cap (₹Cr) | P/E | P/B | "
         "Fwd P/E | EPS TTM | Div Yield% | 52W Chg% | Analyst Rating |",
-        "|--------|---------|--------|---------|--------------|-----|-----|"
+        "|--------|---------|---------------|---------------|---------|--------------|-----|-----|"
         "--------|---------|-----------|----------|----------------|",
     ]
-    for c, screen_label in candidates:
+    for c, sector_label, criteria in candidates:
         sym        = c.get("symbol", "")
         name       = (c.get("shortName") or c.get("longName") or "")[:22]
-        cmp        = c.get("regularMarketPrice") or 0
-        mkt_cap_cr = round((c.get("marketCap") or 0) / 1e7, 0)
-        pe         = round(c.get("trailingPE") or 0, 1) or "N/A"
-        fwd_pe     = round(c.get("forwardPE") or 0, 1) or "N/A"
-        pb         = round(c.get("priceToBook") or 0, 2) or "N/A"
-        eps        = c.get("epsTrailingTwelveMonths") or "N/A"
-        div_yld    = round(c.get("dividendYield") or 0, 2)
-        chg_52w    = round(c.get("fiftyTwoWeekChangePercent") or 0, 1)
-        rating     = c.get("averageAnalystRating") or "N/A"
+        cmp        = c.get("regularMarketPrice")
+        mkt_cap    = c.get("marketCap")
+        mkt_cap_cr = round(float(mkt_cap) / 1e7, 0) if mkt_cap not in (None, "") else None
+        pe         = round(float(c.get("trailingPE")), 1) if c.get("trailingPE") not in (None, "") else None
+        fwd_pe     = round(float(c.get("forwardPE")), 1) if c.get("forwardPE") not in (None, "") else None
+        pb         = round(float(c.get("priceToBook")), 2) if c.get("priceToBook") not in (None, "") else None
+        eps        = c.get("epsTrailingTwelveMonths")
+        div_yld    = _normalize_percent_value(c.get("dividendYield"))
+        chg_52w    = _normalize_percent_value(c.get("fiftyTwoWeekChangePercent"))
+        rating     = c.get("averageAnalystRating")
         lines.append(
-            f"| {sym} | {name} | {screen_label} | ₹{cmp:,.1f} | ₹{mkt_cap_cr:,.0f} | "
-            f"{pe} | {pb} | {fwd_pe} | {eps} | {div_yld}% | "
-            f"{chg_52w:+.1f}% | {rating} |"
+            f"| {sym} | {name} | {sector_label[:22]} | {criteria[:28]} | "
+            f"{_fmt_num(cmp, decimals=1, prefix='₹')} | {_fmt_num(mkt_cap_cr, decimals=0, prefix='₹')} | "
+            f"{_fmt_text(pe)} | {_fmt_text(pb)} | {_fmt_text(fwd_pe)} | {_fmt_text(eps)} | {_fmt_pct(div_yld, decimals=2)} | "
+            f"{_fmt_pct(chg_52w, decimals=1)} | {_fmt_text(rating)} |"
         )
     return lines
 
@@ -2612,7 +2720,7 @@ def _screen_nse_candidates(exclude_tickers: set) -> Tuple[str, Dict[str, Dict[st
 
     for cat_id, cat_name, cap_floor in category_specs:
         sub_queries = _build_sector_aware_queries(cat_id, cap_floor)
-        cat_candidates: List[Tuple[Dict, str]] = []
+        cat_candidates: List[Tuple[Dict, str, str]] = []
 
         for sector_label, criteria, query, sort_field in sub_queries:
             quotes = _run_screen(query, sort_field, _SCREEN_SIZE_PER_CATEGORY)
@@ -2620,7 +2728,7 @@ def _screen_nse_candidates(exclude_tickers: set) -> Tuple[str, Dict[str, Dict[st
                 sym = q.get("symbol", "")
                 if sym and sym not in exclude_tickers and sym not in seen:
                     seen.add(sym)
-                    cat_candidates.append((q, sector_label))
+                    cat_candidates.append((q, sector_label, criteria))
                     all_quotes[sym] = q
 
         sections.append(f"\n### Category {cat_id} — {cat_name}")
@@ -2639,7 +2747,7 @@ def _screen_nse_candidates(exclude_tickers: set) -> Tuple[str, Dict[str, Dict[st
 
     sections.append(
         "> **AI instruction:** For each candidate, validate against GrahamPrompt criteria "
-        "(Parts D, E, F, G). Use the **Screen** column to apply the correct sector valuation "
+        "(Parts D, E, F, G). Use the **Sector Bucket** and **Rule Snapshot** columns to apply the correct sector valuation "
         "framework — do NOT apply P/E to Financials; use P/B instead. "
         "Recommend ENTER only if the stock is superior to at least one current holding "
         "OR solves a specific portfolio weakness. Suggest exact share count and entry price zone.\n"
@@ -2764,7 +2872,7 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
 
     for cat_id, cat_name in category_specs:
         sub_queries = _build_sector_aware_queries(cat_id, _CAP_FRESH_MIN)
-        cat_candidates: List[Tuple[Dict, str]] = []
+        cat_candidates: List[Tuple[Dict, str, str]] = []
 
         for sector_label, criteria, query, sort_field in sub_queries:
             quotes = _run_screen(query, sort_field, _SCREEN_SIZE_PER_CATEGORY)
@@ -2772,7 +2880,7 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
                 sym = q.get("symbol", "")
                 if sym and sym not in seen:
                     seen.add(sym)
-                    cat_candidates.append((q, sector_label))
+                    cat_candidates.append((q, sector_label, criteria))
                     all_quotes[sym] = q
 
         sections.append(f"\n### Category {cat_id} — {cat_name}")
@@ -3102,6 +3210,7 @@ def prepare_rebalance_analysis(transactions_model) -> Dict[str, Any]:
     market_data        = _build_market_data_section(ticker_data)
     recent_tx_review   = _build_recent_transaction_review(positions_by_portfolio, today)
     notes_context      = _build_position_notes_section(positions_by_portfolio)
+    reconciliation     = _build_reconciliation_checks(transactions)
     instructions       = _build_analytical_instructions(positions_by_portfolio, today, cash_by_portfolio)
 
     logger.info("Screening NSE candidates for new ENTER actions...")
@@ -3137,6 +3246,7 @@ def prepare_rebalance_analysis(transactions_model) -> Dict[str, Any]:
         f"{sizing_violations}\n"
         f"{recent_tx_review}\n"
         f"{notes_context}\n"
+        f"{reconciliation}\n"
         f"{forward_outlook}\n"
         f"{market_data}\n"
         f"{candidates_section}\n"

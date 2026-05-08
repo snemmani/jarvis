@@ -68,7 +68,7 @@ SYSTEM_PROMPT = [
     "You have access to the following tools, and depending on my request, you will call the appropriate tool:",
     "1. Expenses Tool – If I talk about expenses, use this tool to add or list my expenses.",
     "2. MAG Tool – If I talk about MAG (my calendar/events), use this tool to add or list my MAG.",
-    "3. Portfolio_Tool – If I talk about portfolio transactions (buying or selling stocks/shares, recording a trade, listing my portfolio transactions, depositing or withdrawing cash from a portfolio), use this tool.",
+    "3. Portfolio_Tool – If I talk about portfolio transactions (buying or selling stocks/shares, recording a trade, listing my portfolio transactions, depositing or withdrawing cash from a portfolio), use this tool. Also use this tool when the message starts with 'Portfolio transaction:' — that means a screenshot was parsed and you must record it as-is, preserving the Note exactly.",
     "4. Wolfram_Alpha_Tool – If I ask about current events, latest news, mathematical questions, astronomical questions, conversions between units, flight ticket fares, nutrition information of food, stock prices, use this tool.",
     "5. Translation_Tool – If I ask for translation:\n   - And I do not specify source/target languages, assume English to Sanskrit.\n   - If I do specify the languages, translate accordingly.",
     "6. Expense_Analytics_Tool – If I ask for expense charts, spending breakdown, category analysis, daily trend, or any analytics/visualisation, use this tool. Pass a JSON string with 'start_date' (YYYY-MM-DD), 'end_date' (YYYY-MM-DD, exclusive upper bound), and 'chart_type' ('pie' for category breakdown, 'bar' for daily trend). Example: {\"start_date\": \"2025-04-01\", \"end_date\": \"2025-05-01\", \"chart_type\": \"pie\"}.",
@@ -322,10 +322,19 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(file_name, "rb") as img_file:
             b64 = base64.b64encode(img_file.read()).decode("utf-8")
-        caption_part = (
-            {"type": "input_text", "text": f"The caption of the Image is: {caption} so assume the caption is the <item> for this transaction"}
+        caption_instruction = (
+            f"USER CAPTION: \"{caption}\"\n\n"
+            "The caption is the user's own words and has HIGHER authority than anything visible in the image.\n"
+            "Apply it as follows — the caption may contain any combination of these overrides:\n"
+            "  • A stock ticker (e.g. INFY.NS, TCS.BO) → use this as Ticker instead of what the image shows.\n"
+            "  • A portfolio name (e.g. LT, Core, Default) → use this as Portfolio.\n"
+            "  • A note, thesis, condition, or rationale (e.g. 'exit on governance shock', 'trim if NIM < 9%') "
+            "→ include this verbatim in the Note field.\n"
+            "  • Any combination of the above — apply all corrections simultaneously.\n"
+            "Whatever the caption says overrides the image for that field. "
+            "The note portion must be copied exactly — do not paraphrase or shorten it."
             if caption
-            else {"type": "input_text", "text": "No caption provided."}
+            else "No caption was provided. Use values from the image only."
         )
         response = openai_model.responses.create(
             model=OPENAI_MODEL,
@@ -333,15 +342,22 @@ async def image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": (
-                        "Summarize the image content in a single sentence.\n"
-                        "Except if it is a transaction.\n"
-                        "If it is a transaction, Provide response as below message.\n"
-                        "Spent <amount> on <item|whoever the money was sent to> on <date>.\n"
-                        "If date is not present, assume today's date.\n"
-                        "If amount is not present, assume it is zero.\n"
-                        "If item is not present, assume it is miscellaneous."
+                        "Look at this image and classify it as one of three types:\n\n"
+                        "TYPE 1 — EXPENSE (UPI payment, bill, receipt, money transfer):\n"
+                        "  Respond: Spent <amount> on <item or recipient> on <date>.\n"
+                        "  If no date, use today. If no amount, use zero. If no item, use miscellaneous.\n\n"
+                        "TYPE 2 — PORTFOLIO TRANSACTION (stock broker app, trade confirmation, "
+                        "buy/sell order, demat statement):\n"
+                        "  Respond in this exact format:\n"
+                        "  Portfolio transaction: <Buy|Sell> <shares> shares of <TICKER> at ₹<price> on <date>."
+                        " Portfolio: <portfolio name or 'Default'>."
+                        " Note: <note text, or 'None' if no note>.\n"
+                        "  Ticker must include exchange suffix (.NS for NSE, .BO for BSE).\n"
+                        "  If no date visible, use today.\n\n"
+                        "TYPE 3 — ANYTHING ELSE:\n"
+                        "  Respond with a one-sentence summary of the image.\n\n"
+                        f"{caption_instruction}"
                     )},
-                    caption_part,
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
                 ],
             }],
