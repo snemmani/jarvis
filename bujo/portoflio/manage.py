@@ -6,11 +6,17 @@ from typing import Dict, List
 import yfinance as yf
 
 from bujo.models.portfolio_transactions import PortfolioTransactions
+from bujo.portoflio.ledger import build_portfolio_ledger
 from bujo.base import llm
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
+try:
+    from langgraph.errors import GraphRecursionError
+except Exception:
+    class GraphRecursionError(Exception):
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,9 @@ class PortfolioManager:
                     continue
                 logger.error("Error in agent_portfolio: %s", e, exc_info=True)
                 return "An error occurred while processing your request."
+            except GraphRecursionError as e:
+                logger.error("Error in agent_portfolio: %s", e, exc_info=True)
+                return "I got stuck in a loop trying to process that — could you rephrase or be more specific?"
             except Exception as e:
                 logger.error("Error in agent_portfolio: %s", e, exc_info=True)
                 return "An error occurred while processing your request."
@@ -236,129 +245,28 @@ class PortfolioManager:
             return {"as_of": datetime.now(), "portfolios": {}, "totals": {}, "holdings": [], "risk_flags": []}
 
         usd_to_inr = self._get_usd_to_inr()
-        portfolios: Dict[str, Dict] = {}
-
-        for tx in transactions:
-            ticker = (tx.get("Ticker") or "").strip().upper()
-            tx_type = (tx.get("TransactionType") or "").strip()
-            shares = float(tx.get("NoOfShares") or 0)
-            cost = float(tx.get("CostPerShare") or 0)
-            cmp = float(tx.get("CMP") or 0)
-            portfolio = (tx.get("Portfolio") or "Default").strip()
-
-            if not ticker or shares == 0:
-                continue
-
-            entry = portfolios.setdefault(portfolio, {
-                "cash": 0.0,
-                "positions": {},
-            })
-
-            if ticker == "CASH":
-                if tx_type == "Deposit":
-                    entry["cash"] += cost
-                elif tx_type in {"Withdraw", "Withdrawal"}:
-                    entry["cash"] -= cost
-                continue
-
-            fx = 1.0 if ticker.endswith((".NS", ".BO")) else usd_to_inr
-            pos = entry["positions"].setdefault(ticker, {
-                "ticker": ticker,
-                "shares_bought": 0.0,
-                "shares_sold": 0.0,
-                "buy_cost_inr": 0.0,
-                "sell_proceeds_inr": 0.0,
-                "cmp_inr": 0.0,
-            })
-            if cmp:
-                pos["cmp_inr"] = cmp * fx
-            if tx_type == "Buy":
-                pos["shares_bought"] += shares
-                pos["buy_cost_inr"] += shares * cost * fx
-            elif tx_type == "Sell":
-                pos["shares_sold"] += shares
-                pos["sell_proceeds_inr"] += shares * cost * fx
-
-        holdings: List[Dict] = []
-        portfolio_rows: Dict[str, Dict] = {}
-        total_invested = total_current = total_cash = 0.0
-
-        for portfolio_name, pdata in portfolios.items():
-            rows: List[Dict] = []
-            invested = current = 0.0
-            for ticker, pos in pdata["positions"].items():
-                net_shares = pos["shares_bought"] - pos["shares_sold"]
-                if net_shares <= 0:
-                    continue
-                avg_cost = pos["buy_cost_inr"] / pos["shares_bought"] if pos["shares_bought"] else 0.0
-                invested_value = net_shares * avg_cost
-                current_value = net_shares * pos["cmp_inr"]
-                unrealised = current_value - invested_value
-                row = {
-                    "ticker": ticker,
-                    "portfolio": portfolio_name,
-                    "net_shares": net_shares,
-                    "avg_cost_inr": avg_cost,
-                    "cmp_inr": pos["cmp_inr"],
-                    "invested_inr": invested_value,
-                    "current_inr": current_value,
-                    "unrealised_pl": unrealised,
-                    "unrealised_pct": (unrealised / invested_value * 100) if invested_value else 0.0,
-                }
-                rows.append(row)
-                holdings.append(row)
-                invested += invested_value
-                current += current_value
-
-            cash = pdata["cash"]
-            total_value = current + cash
-            portfolio_rows[portfolio_name] = {
-                "name": portfolio_name,
-                "invested_inr": invested,
-                "current_inr": current,
-                "cash_inr": cash,
-                "total_value_inr": total_value,
-                "unrealised_pl": current - invested,
-                "holdings": sorted(rows, key=lambda item: item["current_inr"], reverse=True),
-            }
-            total_invested += invested
-            total_current += current
-            total_cash += cash
-
-        holdings.sort(key=lambda item: item["current_inr"], reverse=True)
-        grand_total = total_current + total_cash
-        for item in holdings:
-            item["weight_pct"] = (item["current_inr"] / grand_total * 100) if grand_total else 0.0
+        ledger = build_portfolio_ledger(transactions, fx_rates={"USD": usd_to_inr})
+        holdings = ledger.get("holdings", [])
+        totals = ledger.get("totals", {})
 
         risk_flags: List[str] = []
-        concentration = [h for h in holdings if h["weight_pct"] > 15]
+        concentration = [h for h in holdings if h.get("weight_pct", 0.0) > 15]
         if concentration:
             risk_flags.append(
-                "Large positions: " + ", ".join(f"{h['ticker']} {h['weight_pct']:.1f}%" for h in concentration[:3])
+                "Large positions: "
+                + ", ".join(f"{h['ticker']} {h['weight_pct']:.1f}%" for h in concentration[:3])
             )
-        if total_cash < 0:
-            risk_flags.append(f"Negative cash balance: ₹{total_cash:,.0f}")
-        low_cmp = [h for h in holdings if h["cmp_inr"] <= 0]
+        if totals.get("cash_inr", 0.0) < 0:
+            risk_flags.append(f"Negative cash balance: ₹{totals.get('cash_inr', 0.0):,.0f}")
+        low_cmp = [h for h in holdings if h.get("cmp_inr", 0.0) <= 0]
         if low_cmp:
             risk_flags.append(f"{len(low_cmp)} holding(s) missing CMP updates")
+        risk_flags.extend(ledger.get("warnings") or [])
         if not risk_flags:
             risk_flags.append("No immediate concentration or cash warnings.")
 
-        return {
-            "as_of": datetime.now(),
-            "totals": {
-                "invested_inr": total_invested,
-                "current_inr": total_current,
-                "cash_inr": total_cash,
-                "total_value_inr": grand_total,
-                "unrealised_pl": total_current - total_invested,
-                "unrealised_pct": ((total_current - total_invested) / total_invested * 100) if total_invested else 0.0,
-                "portfolio_count": len(portfolio_rows),
-            },
-            "portfolios": portfolio_rows,
-            "holdings": holdings,
-            "risk_flags": risk_flags,
-        }
+        ledger["risk_flags"] = risk_flags
+        return ledger
 
     @staticmethod
     def _get_usd_to_inr() -> float:
@@ -380,71 +288,13 @@ class PortfolioManager:
 
         usd_to_inr = self._get_usd_to_inr()
         logger.info("USD → INR rate: %s", usd_to_inr)
+        ledger = build_portfolio_ledger(transactions, fx_rates={"USD": usd_to_inr})
 
-        ticker_data: Dict[tuple, Dict] = {}
-        for tx in transactions:
-            ticker    = tx.get("Ticker", "").strip()
-            tx_type   = tx.get("TransactionType", "").strip()
-            shares    = float(tx.get("NoOfShares") or 0)
-            cost      = float(tx.get("CostPerShare") or 0)
-            cmp       = float(tx.get("CMP") or 0)
-            portfolio = tx.get("Portfolio", "Unknown").strip()
-
-            if not ticker or ticker.upper() == "CASH" or shares == 0:
-                continue
-
-            is_inr   = ticker.upper().endswith(".NS")
-            currency = "INR" if is_inr else "USD"
-            fx       = 1.0 if is_inr else usd_to_inr
-
-            key = (ticker, portfolio)
-            if key not in ticker_data:
-                ticker_data[key] = {
-                    "portfolio": portfolio, "currency": currency,
-                    "total_bought": 0.0, "total_sold": 0.0,
-                    "buy_cost_inr": 0.0, "sell_proceeds_inr": 0.0,
-                    "cmp_inr": cmp * fx,
-                }
-            if cmp:
-                ticker_data[key]["cmp_inr"] = cmp * fx
-            if tx_type == "Buy":
-                ticker_data[key]["total_bought"]       += shares
-                ticker_data[key]["buy_cost_inr"]       += shares * cost * fx
-            elif tx_type == "Sell":
-                ticker_data[key]["total_sold"]          += shares
-                ticker_data[key]["sell_proceeds_inr"]   += shares * cost * fx
-
-        open_tickers:   List[Dict] = []
+        open_tickers: List[Dict] = []
         closed_tickers: List[Dict] = []
-
-        for (ticker, __), d in ticker_data.items():
-            net_shares   = d["total_bought"] - d["total_sold"]
-            avg_cost_inr = (d["buy_cost_inr"] / d["total_bought"]) if d["total_bought"] else 0.0
-            cmp_inr      = d["cmp_inr"]
-
-            if net_shares > 0:
-                current_value_inr  = net_shares * cmp_inr
-                invested_value_inr = net_shares * avg_cost_inr
-                unrealised_pl      = current_value_inr - invested_value_inr
-                unrealised_pct     = (unrealised_pl / invested_value_inr * 100) if invested_value_inr else 0.0
-                realised_pl        = d["sell_proceeds_inr"] - (d["total_sold"] * avg_cost_inr)
-                open_tickers.append({
-                    "ticker": ticker, "currency": d["currency"],
-                    "net_shares": net_shares, "avg_cost_inr": avg_cost_inr,
-                    "cmp_inr": cmp_inr, "invested_inr": invested_value_inr,
-                    "current_inr": current_value_inr, "unrealised_pl": unrealised_pl,
-                    "unrealised_pct": unrealised_pct, "realised_pl": realised_pl,
-                    "portfolio": d["portfolio"],
-                })
-            else:
-                realised_pl  = d["sell_proceeds_inr"] - d["buy_cost_inr"]
-                realised_pct = (realised_pl / d["buy_cost_inr"] * 100) if d["buy_cost_inr"] else 0.0
-                closed_tickers.append({
-                    "ticker": ticker, "currency": d["currency"],
-                    "buy_cost_inr": d["buy_cost_inr"], "sell_inr": d["sell_proceeds_inr"],
-                    "realised_pl": realised_pl, "realised_pct": realised_pct,
-                    "portfolio": d["portfolio"],
-                })
+        for portfolio in ledger.get("portfolios", {}).values():
+            open_tickers.extend(portfolio.get("holdings") or [])
+            closed_tickers.extend(portfolio.get("closed_positions") or [])
 
         def fmt_inr(v: float) -> str: return f"₹{v:,.2f}"
         def pl_emoji(v: float) -> str: return "🟢" if v >= 0 else "🔴"

@@ -1,7 +1,13 @@
 """Portoflio package.
 
-This package provides the Portfolio management tools.
+This package provides Portfolio management helpers.
 """
-from .manage import PortfolioManager
 
 __all__ = ["PortfolioManager"]
+
+
+def __getattr__(name):
+    if name == "PortfolioManager":
+        from .manage import PortfolioManager
+        return PortfolioManager
+    raise AttributeError(name)

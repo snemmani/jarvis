@@ -3,7 +3,9 @@ requests
 cohere
 langchain
 langchain_community
+langgraph
 dotenv
+python-dotenv
 langchain-openai
 wolframalpha
 wakeonlan
@@ -15,3 +17,4 @@ matplotlib
 debugpy
 google-search-results
 beautifulsoup4
+pytest

@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch, MagicMock
 from bujo.models.mag import MAG
@@ -43,21 +44,24 @@ class TestMAG(unittest.TestCase):
             headers=self.mag.headers,
         )
 
+    @patch.object(MAG, "find_by_date")
     @patch("requests.patch")
-    def test_update_success(self, mock_patch):
+    def test_update_success(self, mock_patch, mock_find_by_date):
         mock_response = MagicMock()
         mock_response.ok = True
-        mock_response.json.return_value = {"id": "123", "name": "Updated"}
+        mock_response.text = "updated"
         mock_patch.return_value = mock_response
+        mock_find_by_date.return_value = {"Id": "123", "Note": "Old", "Exercise": False}
 
-        record_id = "123"
-        data = {"name": "Updated"}
-        result = self.mag.update(record_id, data)
+        result = self.mag.update(json.dumps({
+            "date_filter": "2025-04-10",
+            "payload": {"Note": "Updated", "Ignored": "not allowed"},
+        }))
 
-        self.assertEqual(result, {"id": "123", "name": "Updated"})
+        self.assertEqual(result, "updated")
         mock_patch.assert_called_once_with(
-            f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records/{record_id}",
-            json=data,
+            f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records",
+            json={"Id": "123", "Exercise": False, "Note": "Updated"},
             headers=self.mag.headers,
         )
 
@@ -72,7 +76,8 @@ class TestMAG(unittest.TestCase):
 
         self.assertTrue(result)
         mock_delete.assert_called_once_with(
-            f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records/{record_id}",
+            f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records",
+            json=[{"Id": record_id}],
             headers=self.mag.headers,
         )
 
@@ -83,13 +88,13 @@ class TestMAG(unittest.TestCase):
         mock_response.json.return_value = {"list": [{"id": "123", "name": "Test"}]}
         mock_get.return_value = mock_response
 
-        result = self.mag.list(limit=10)
+        result = self.mag.list()
 
         self.assertEqual(result, [{"id": "123", "name": "Test"}])
         mock_get.assert_called_once_with(
             f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records",
             headers=self.mag.headers,
-            params={"limit": 10},
+            params={"limit": 1000, "offset": 0},
         )
 
     @patch("requests.get")

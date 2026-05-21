@@ -15,6 +15,8 @@ import requests
 import yfinance as yf
 
 from bujo.base import openai_model
+from bujo.portoflio.ledger import compute_cash_by_portfolio as _ledger_compute_cash_by_portfolio
+from bujo.portoflio.ledger import compute_positions_by_portfolio as _ledger_compute_positions_by_portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -588,104 +590,16 @@ def _cash_conversion_ratio(fin_data: List[Dict], cf_data: List[Dict]) -> Optiona
 def _compute_positions_by_portfolio(
     transactions: List[Dict],
 ) -> Dict[str, Dict[str, Dict]]:
+    """Aggregate stock transactions into open positions by portfolio.
+
+    Delegates to the shared ledger module so rebalance, dashboards, and P&L
+    use the same transaction normalisation and average-cost logic.
     """
-    Returns:
-      {portfolio: {ticker: {net_shares, avg_cost, total_invested,
-                            buy_dates, sell_dates, total_bought, total_sold,
-                            sell_proceeds, all_buy_lots, notes}}}
-    all_buy_lots: list of (date_str, shares, cost) for XIRR approximation.
-    """
-    raw: Dict[str, Dict[str, Dict]] = {}
-
-    for tx in transactions:
-        ticker    = (tx.get("Ticker") or "").strip()
-        tx_type   = (tx.get("TransactionType") or "").strip()
-        shares    = float(tx.get("NoOfShares") or 0)
-        cost      = float(tx.get("CostPerShare") or 0)
-        portfolio = (tx.get("Portfolio") or "Default").strip()
-        date_str  = (tx.get("Date") or "")[:10]
-        note      = (tx.get("Note") or "").strip()
-
-        if not ticker or ticker.upper() == _CASH_TICKER or shares == 0:
-            continue
-
-        raw.setdefault(portfolio, {})
-        raw[portfolio].setdefault(ticker, {
-            "total_bought":  0.0,
-            "total_sold":    0.0,
-            "buy_cost":      0.0,
-            "sell_proceeds": 0.0,
-            "buy_dates":     [],
-            "sell_dates":    [],
-            "all_buy_lots":  [],
-            "notes":         [],
-        })
-
-        pos = raw[portfolio][ticker]
-        if note:
-            pos["notes"].append({
-                "date": date_str,
-                "type": tx_type,
-                "note": note,
-            })
-        if tx_type == "Buy":
-            pos["total_bought"] += shares
-            pos["buy_cost"]     += shares * cost
-            pos["buy_dates"].append(date_str)
-            pos["all_buy_lots"].append((date_str, shares, cost))
-        elif tx_type == "Sell":
-            pos["total_sold"]      += shares
-            pos["sell_proceeds"]   += shares * cost
-            pos["sell_dates"].append(date_str)
-
-    result: Dict[str, Dict[str, Dict]] = {}
-    for portfolio, tickers in raw.items():
-        result[portfolio] = {}
-        for ticker, d in tickers.items():
-            net = d["total_bought"] - d["total_sold"]
-            if net <= 0:
-                continue
-            avg_cost = d["buy_cost"] / d["total_bought"] if d["total_bought"] else 0.0
-            result[portfolio][ticker] = {
-                "net_shares":    net,
-                "avg_cost":      avg_cost,
-                "total_invested": net * avg_cost,
-                "buy_dates":     sorted(d["buy_dates"]),
-                "sell_dates":    sorted(d["sell_dates"]),
-                "total_bought":  d["total_bought"],
-                "total_sold":    d["total_sold"],
-                "sell_proceeds": d["sell_proceeds"],
-                "all_buy_lots":  sorted(d["all_buy_lots"], key=lambda x: x[0]),
-                "notes":         sorted(
-                    d["notes"],
-                    key=lambda item: ((item.get("date") or ""), (item.get("type") or "")),
-                    reverse=True,
-                ),
-            }
-
-    return result
-
+    return _ledger_compute_positions_by_portfolio(transactions)
 
 def _compute_cash_by_portfolio(transactions: List[Dict]) -> Dict[str, float]:
-    """
-    Returns {portfolio: net_cash_balance} from explicit CASH ticker rows.
-    TransactionType 'Deposit' adds cash; 'Withdraw' subtracts it.
-    Amount = NoOfShares * CostPerShare (bot always records NoOfShares=1).
-    """
-    balances: Dict[str, float] = {}
-    for tx in transactions:
-        ticker = (tx.get("Ticker") or "").strip().upper()
-        if ticker != _CASH_TICKER:
-            continue
-        tx_type   = (tx.get("TransactionType") or "").strip()
-        amount    = float(tx.get("NoOfShares") or 0) * float(tx.get("CostPerShare") or 0)
-        portfolio = (tx.get("Portfolio") or "Default").strip()
-        balances.setdefault(portfolio, 0.0)
-        if tx_type == "Deposit":
-            balances[portfolio] += amount
-        elif tx_type in {"Withdraw", "Withdrawal"}:
-            balances[portfolio] -= amount
-    return balances
+    """Return {portfolio: net_cash_balance} from explicit CASH ledger rows."""
+    return _ledger_compute_cash_by_portfolio(transactions)
 
 
 # ──────────────────────────────────────────────
@@ -2438,7 +2352,7 @@ Stocks to Buy | Accumulate on Dips | Trim | Exit | Hold | Recent Purchases to Re
 _CAP_LARGE        = 50_000_000_000   # ₹5,000 Cr  — Category A (rebalance)
 _CAP_MID          = 20_000_000_000   # ₹2,000 Cr  — Category B (rebalance)
 _CAP_SMALL        = 10_000_000_000   # ₹1,000 Cr  — Category C (rebalance)
-_CAP_FRESH_MIN    = 80_000_000_000   # ₹8,000 Cr  — fresh portfolio: large + upper mid-cap only
+_CAP_FRESH_MIN    = 10_000_000_000   # ₹1,000 Cr  — fresh portfolio: small-cap and above
 
 _SCREEN_SIZE_PER_CATEGORY = int(
     os.environ.get("REBALANCE_SCREEN_SIZE_PER_CATEGORY", "30")
@@ -2852,7 +2766,7 @@ OUTPUT QUALITY RULES
 
 def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
     """
-    Screen NSE large + upper mid-cap stocks (≥₹8,000 Cr) across sector-aware
+    Screen NSE stocks above ₹1,000 Cr market cap across sector-aware
     sub-queries for Categories A / B / C.
     Returns (markdown_section, {symbol: quote_dict}).
     """
@@ -2865,8 +2779,8 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
     seen: set            = set()
     all_quotes: Dict[str, Dict] = {}
     sections: List[str]  = [
-        "## Screened Candidates — Large & Upper Mid-Cap NSE Stocks (≥₹8,000 Cr)\n",
-        "_NSE-listed, market cap ≥₹8,000 Cr. Sector-appropriate P/E thresholds applied. "
+        "## Screened Candidates — NSE Stocks Above ₹1,000 Cr Market Cap\n",
+        "_NSE-listed, market cap >₹1,000 Cr. Sector-appropriate P/E thresholds applied. "
         f"AI must validate further before recommending. Wide capture mode: up to {_SCREEN_SIZE_PER_CATEGORY} names per sub-screen before the forward-risk gate._\n",
     ]
 
@@ -2900,29 +2814,28 @@ def _screen_fresh_portfolio_candidates() -> Tuple[str, Dict[str, Dict]]:
     return "\n".join(sections), all_quotes
 
 
-def run_fresh_portfolio_analysis(
+def prepare_fresh_portfolio_analysis(
     amount: float,
     preferences: Optional[Dict] = None,
-) -> Tuple[Optional[str], Optional[str], str]:
+) -> Dict[str, Any]:
     """
-    Build a fresh portfolio recommendation for the given cash amount.
+    Build the fresh portfolio input prompt and write it to disk, without calling the LLM.
     preferences keys: risk_appetite, horizon, sector_focus, sector_avoid, stock_count
-    Returns (report_path, input_path, usage_msg).
     """
     prefs = preferences or {}
     logger.info(
-        "Starting fresh portfolio analysis — amount: ₹%.0f, prefs: %s, model: %s",
+        "Preparing fresh portfolio analysis — amount: ₹%.0f, prefs: %s, model: %s",
         amount, prefs, _REBALANCE_MODEL,
     )
 
     candidates_section, screened_quotes = _screen_fresh_portfolio_candidates()
 
     if not screened_quotes:
-        return None, None, "📭 No candidates returned from screener — yfinance screen may be unavailable. Try again later."
+        return {"error": "📭 No candidates returned from screener — yfinance screen may be unavailable. Try again later."}
 
     eligible_quotes, ticker_data, candidate_gate_section, candidate_rows = _evaluate_screened_candidates(screened_quotes)
     if not eligible_quotes:
-        return None, None, "📭 Candidates were screened, but all were rejected by the forward-risk and event gate. Review the watchlist manually or widen the search universe."
+        return {"error": "📭 Candidates were screened, but all were rejected by the forward-risk and event gate. Review the watchlist manually or widen the search universe."}
 
     market_data = _build_market_data_section(ticker_data)
     candidate_forward_outlook = _build_candidate_forward_outlook_section(candidate_rows)
@@ -2954,7 +2867,7 @@ def run_fresh_portfolio_analysis(
     user_message = (
         f"## Fresh Portfolio Construction Request\n\n"
         f"**Available Cash:** ₹{amount:,.0f}\n"
-        f"**Universe:** NSE large-cap and upper mid-cap stocks (market cap ≥₹8,000 Cr)\n"
+        f"**Universe:** NSE stocks above ₹1,000 Cr market cap\n"
         f"**Date:** {date.today().strftime('%d %b %Y')}\n\n"
         f"### Investor Preferences\n"
         f"**Risk Appetite:** {risk}\n"
@@ -3020,6 +2933,21 @@ def run_fresh_portfolio_analysis(
     input_tmp.close()
     logger.info("Fresh portfolio input written to: %s", input_tmp.name)
 
+    return {
+        "input_path": input_tmp.name,
+        "input_md": input_md,
+        "user_message": user_message,
+        "timestamp": timestamp,
+        "amount": amount,
+    }
+
+
+def execute_fresh_portfolio_analysis(prepared: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Run the LLM for an already prepared fresh portfolio request."""
+    user_message = prepared["user_message"]
+    timestamp = prepared["timestamp"]
+    amount = prepared["amount"]
+
     try:
         response = openai_model.chat.completions.create(
             model=_REBALANCE_MODEL,
@@ -3064,11 +2992,27 @@ def run_fresh_portfolio_analysis(
             f"Output tokens: {out_tok:,}\n"
             f"Est. cost:     ${cost_usd:.4f} USD  (~₹{cost_inr:.2f})"
         )
-        return report_tmp.name, input_tmp.name, usage_msg
+        return report_tmp.name, usage_msg
 
     except Exception as e:
         logger.error("Fresh portfolio analysis failed: %s", e, exc_info=True)
-        return None, input_tmp.name, f"❌ Fresh portfolio analysis failed: {e}"
+        return None, f"❌ Fresh portfolio analysis failed: {e}"
+
+
+def run_fresh_portfolio_analysis(
+    amount: float,
+    preferences: Optional[Dict] = None,
+) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Build and execute a fresh portfolio recommendation for direct callers.
+    The Telegram flow uses prepare/execute separately so the user can review
+    the input prompt before forwarding it to the LLM.
+    """
+    prepared = prepare_fresh_portfolio_analysis(amount, preferences)
+    if prepared.get("error"):
+        return None, None, prepared["error"]
+    report_path, usage_msg = execute_fresh_portfolio_analysis(prepared)
+    return report_path, prepared["input_path"], usage_msg
 
 
 # ──────────────────────────────────────────────

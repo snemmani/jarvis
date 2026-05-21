@@ -14,7 +14,8 @@ from bujo.portoflio.rebalance import (
     prepare_rebalance_analysis,
     execute_rebalance_analysis,
     run_rebalance_analysis,
-    run_fresh_portfolio_analysis,
+    prepare_fresh_portfolio_analysis,
+    execute_fresh_portfolio_analysis,
 )
 from bujo.handlers.utils import send_long
 
@@ -25,7 +26,9 @@ BP_AMOUNT, BP_RISK, BP_HORIZON, BP_SECTOR_FOCUS, BP_SECTOR_AVOID, BP_STOCK_COUNT
 _BP_SECTORS = ["IT / Tech", "Banking / Finance", "Pharma", "FMCG / Consumer", "Manufacturing", "Energy"]
 _PORTFOLIO_DASHBOARD_PREFIX = "pdash_"
 _REBALANCE_APPROVAL_PREFIX = "rbal_"
+_FRESH_PORTFOLIO_APPROVAL_PREFIX = "bp_llm_"
 _rebalance_pending: dict[int, dict] = {}
+_fresh_portfolio_pending: dict[int, dict] = {}
 
 
 @check_authorization
@@ -513,31 +516,80 @@ async def bp_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await query.message.reply_text(
-        f"⏳ Screening NSE large & upper mid-cap stocks and building your ₹{amount:,.0f} portfolio…\n"
-        "This may take 2–3 minutes.",
+        f"⏳ Screening NSE stocks above ₹1,000 Cr market cap and preparing your ₹{amount:,.0f} portfolio prompt…\n"
+        "This may take 1–2 minutes.",
     )
     try:
-        report_path, input_path, usage_msg = await asyncio.to_thread(
-            run_fresh_portfolio_analysis, amount, preferences
+        prepared = await asyncio.to_thread(
+            prepare_fresh_portfolio_analysis, amount, preferences
         )
-        for path, caption in [
-            (input_path,  "📋 Input prompt — screened candidates + fundamentals"),
-            (report_path, "📄 Fresh portfolio report — open in any Markdown viewer"),
-        ]:
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=query.message.chat_id,
-                        document=f,
-                        filename=os.path.basename(path),
-                        caption=caption,
-                    )
-                os.remove(path)
-        await query.message.reply_text(usage_msg)
+        if prepared.get("error"):
+            await query.message.reply_text(prepared["error"])
+            return ConversationHandler.END
+
+        _fresh_portfolio_pending[query.from_user.id] = prepared
+        input_path = prepared["input_path"]
+        if input_path and os.path.exists(input_path):
+            with open(input_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename=os.path.basename(input_path),
+                    caption="📋 Fresh portfolio input prompt — review this before sending to the model",
+                )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Forward To LLM", callback_data=f"{_FRESH_PORTFOLIO_APPROVAL_PREFIX}yes"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"{_FRESH_PORTFOLIO_APPROVAL_PREFIX}no"),
+        ]])
+        await query.message.reply_text(
+            "Prompt generated. Should I forward it to the model and fetch the fresh portfolio report?",
+            reply_markup=keyboard,
+        )
     except Exception as e:
         logger.error("Error in buildPortfolio: %s", e, exc_info=True)
         await query.message.reply_text(f"❌ Error building portfolio: {e}")
     return ConversationHandler.END
+
+
+async def fresh_portfolio_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    prepared = _fresh_portfolio_pending.get(user_id)
+
+    if query.data == f"{_FRESH_PORTFOLIO_APPROVAL_PREFIX}no":
+        if prepared:
+            input_path = prepared.get("input_path")
+            if input_path and os.path.exists(input_path):
+                os.remove(input_path)
+            _fresh_portfolio_pending.pop(user_id, None)
+        await query.edit_message_text("❌ Fresh portfolio request cancelled.")
+        return
+
+    if not prepared:
+        await query.edit_message_text("❌ No pending fresh portfolio prompt found. Run `/buildPortfolio` again.", parse_mode="Markdown")
+        return
+
+    await query.edit_message_text("⏳ Forwarding prompt to the model and generating the fresh portfolio report…")
+    try:
+        report_path, usage_msg = await asyncio.to_thread(execute_fresh_portfolio_analysis, prepared)
+        input_path = prepared.get("input_path")
+        if report_path and os.path.exists(report_path):
+            with open(report_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=f,
+                    filename=os.path.basename(report_path),
+                    caption="📄 Fresh portfolio report — open in any Markdown viewer",
+                )
+            os.remove(report_path)
+        if input_path and os.path.exists(input_path):
+            os.remove(input_path)
+        _fresh_portfolio_pending.pop(user_id, None)
+        await query.message.reply_text(usage_msg)
+    except Exception as e:
+        logger.error("Error in fresh_portfolio_approval_callback: %s", e, exc_info=True)
+        await query.message.reply_text(f"❌ Error generating fresh portfolio report: {e}")
 
 
 async def bp_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
