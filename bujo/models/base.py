@@ -1,8 +1,32 @@
+import json
 import logging
 import requests
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def nocodb_where_from_tool_input(where: Any) -> Optional[str]:
+    if not where:
+        return None
+    if isinstance(where, dict):
+        parsed = where
+    else:
+        cleaned = str(where).replace("```json", "").replace("```", "").strip()
+        if not cleaned:
+            return None
+        parsed = json.loads(cleaned)
+
+    filters = parsed.get("filters") if isinstance(parsed, dict) else None
+    if not filters and isinstance(parsed, dict):
+        filters = parsed.get("where")
+    if not filters:
+        return None
+    if isinstance(filters, str):
+        return filters
+    if isinstance(filters, (list, tuple)):
+        return "~and".join(str(item) for item in filters if item)
+    return str(filters)
 
 
 class BaseNocoDB:

@@ -70,6 +70,14 @@ def _pct(value: float, base: float) -> float:
     return value / base * 100 if base else 0.0
 
 
+def transaction_sort_key(tx: Dict[str, Any]) -> tuple[str, int]:
+    date_str = str(tx.get("Date") or "")[:10]
+    try:
+        row_id = int(tx.get("Id") or 0)
+    except (TypeError, ValueError):
+        row_id = 0
+    return date_str, row_id
+
 def _portfolio_row(name: str) -> Dict[str, Any]:
     return {
         "name": name,
@@ -100,7 +108,7 @@ def build_portfolio_ledger(
     portfolios: Dict[str, Dict[str, Any]] = {}
     warnings: List[str] = []
 
-    for tx in transactions or []:
+    for tx in sorted(transactions or [], key=transaction_sort_key):
         ticker = normalize_ticker(tx.get("Ticker"))
         tx_type = normalize_transaction_type(tx.get("TransactionType"))
         shares = parse_number(tx.get("NoOfShares"))
@@ -144,6 +152,10 @@ def build_portfolio_ledger(
             "total_sold": 0.0,
             "buy_cost_native": 0.0,
             "buy_cost_inr": 0.0,
+            "open_cost_native": 0.0,
+            "open_cost_inr": 0.0,
+            "open_shares": 0.0,
+            "realised_cost_basis_inr": 0.0,
             "sell_proceeds_native": 0.0,
             "sell_proceeds_inr": 0.0,
             "cmp_native": 0.0,
@@ -166,6 +178,9 @@ def build_portfolio_ledger(
             pos["total_bought"] += shares
             pos["buy_cost_native"] += shares * cost_native
             pos["buy_cost_inr"] += shares * cost_native * fx
+            pos["open_shares"] += shares
+            pos["open_cost_native"] += shares * cost_native
+            pos["open_cost_inr"] += shares * cost_native * fx
             if date_str:
                 pos["buy_dates"].append(date_str)
                 pos["all_buy_lots"].append((date_str, shares, cost_native))
@@ -173,6 +188,18 @@ def build_portfolio_ledger(
             pos["total_sold"] += shares
             pos["sell_proceeds_native"] += shares * cost_native
             pos["sell_proceeds_inr"] += shares * cost_native * fx
+            matched_shares = min(shares, pos["open_shares"])
+            if matched_shares > 0:
+                avg_open_native = pos["open_cost_native"] / pos["open_shares"]
+                avg_open_inr = pos["open_cost_inr"] / pos["open_shares"]
+                pos["open_shares"] -= matched_shares
+                pos["open_cost_native"] -= matched_shares * avg_open_native
+                pos["open_cost_inr"] -= matched_shares * avg_open_inr
+                pos["realised_cost_basis_inr"] += matched_shares * avg_open_inr
+                if abs(pos["open_shares"]) < 1e-9:
+                    pos["open_shares"] = 0.0
+                    pos["open_cost_native"] = 0.0
+                    pos["open_cost_inr"] = 0.0
             if date_str:
                 pos["sell_dates"].append(date_str)
         else:
@@ -192,10 +219,10 @@ def build_portfolio_ledger(
         for ticker, pos in portfolio["positions"].items():
             bought = pos["total_bought"]
             sold = pos["total_sold"]
-            net_shares = bought - sold
-            avg_cost_native = pos["buy_cost_native"] / bought if bought else 0.0
-            avg_cost_inr = pos["buy_cost_inr"] / bought if bought else 0.0
-            cost_basis_sold_inr = min(sold, bought) * avg_cost_inr
+            net_shares = pos["open_shares"]
+            avg_cost_native = pos["open_cost_native"] / net_shares if net_shares else 0.0
+            avg_cost_inr = pos["open_cost_inr"] / net_shares if net_shares else 0.0
+            cost_basis_sold_inr = pos["realised_cost_basis_inr"]
             realised_pl = pos["sell_proceeds_inr"] - cost_basis_sold_inr
             realised_pct = _pct(realised_pl, cost_basis_sold_inr)
             realised += realised_pl
@@ -206,7 +233,7 @@ def build_portfolio_ledger(
                 warnings.append(msg)
 
             if net_shares > 0:
-                invested_value = net_shares * avg_cost_inr
+                invested_value = pos["open_cost_inr"]
                 current_value = net_shares * pos["cmp_inr"]
                 unrealised = current_value - invested_value
                 row = {
@@ -297,7 +324,7 @@ def compute_cash_by_portfolio(transactions: List[Dict[str, Any]]) -> Dict[str, f
 
 def compute_positions_by_portfolio(transactions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
     raw: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for tx in transactions or []:
+    for tx in sorted(transactions or [], key=transaction_sort_key):
         ticker = normalize_ticker(tx.get("Ticker"))
         tx_type = normalize_transaction_type(tx.get("TransactionType"))
         shares = parse_number(tx.get("NoOfShares"))
@@ -312,45 +339,55 @@ def compute_positions_by_portfolio(transactions: List[Dict[str, Any]]) -> Dict[s
         pos = raw.setdefault(portfolio, {}).setdefault(ticker, {
             "total_bought": 0.0,
             "total_sold": 0.0,
-            "buy_cost": 0.0,
             "sell_proceeds": 0.0,
-            "buy_dates": [],
             "sell_dates": [],
-            "all_buy_lots": [],
+            "lots": [],
             "notes": [],
         })
         if note:
             pos["notes"].append({"date": date_str, "type": tx_type, "note": note})
         if tx_type == "Buy":
             pos["total_bought"] += shares
-            pos["buy_cost"] += shares * cost
-            if date_str:
-                pos["buy_dates"].append(date_str)
-                pos["all_buy_lots"].append((date_str, shares, cost))
+            pos["lots"].append({"date": date_str, "shares": shares, "cost": cost})
         elif tx_type == "Sell":
             pos["total_sold"] += shares
             pos["sell_proceeds"] += shares * cost
             if date_str:
                 pos["sell_dates"].append(date_str)
+            remaining_to_sell = shares
+            while remaining_to_sell > 1e-9 and pos["lots"]:
+                lot = pos["lots"][0]
+                consumed = min(remaining_to_sell, lot["shares"])
+                lot["shares"] -= consumed
+                remaining_to_sell -= consumed
+                if lot["shares"] <= 1e-9:
+                    pos["lots"].pop(0)
 
     result: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for portfolio, tickers in raw.items():
         result[portfolio] = {}
         for ticker, d in tickers.items():
-            net = d["total_bought"] - d["total_sold"]
+            open_lots = [lot for lot in d["lots"] if lot["shares"] > 1e-9]
+            net = sum(lot["shares"] for lot in open_lots)
             if net <= 0:
                 continue
-            avg_cost = d["buy_cost"] / d["total_bought"] if d["total_bought"] else 0.0
+            total_invested = sum(lot["shares"] * lot["cost"] for lot in open_lots)
+            buy_dates = [lot["date"] for lot in open_lots if lot["date"]]
+            all_buy_lots = [
+                (lot["date"], lot["shares"], lot["cost"])
+                for lot in open_lots
+                if lot["date"]
+            ]
             result[portfolio][ticker] = {
                 "net_shares": net,
-                "avg_cost": avg_cost,
-                "total_invested": net * avg_cost,
-                "buy_dates": sorted(d["buy_dates"]),
+                "avg_cost": total_invested / net if net else 0.0,
+                "total_invested": total_invested,
+                "buy_dates": sorted(buy_dates),
                 "sell_dates": sorted(d["sell_dates"]),
                 "total_bought": d["total_bought"],
                 "total_sold": d["total_sold"],
                 "sell_proceeds": d["sell_proceeds"],
-                "all_buy_lots": sorted(d["all_buy_lots"], key=lambda x: x[0]),
+                "all_buy_lots": sorted(all_buy_lots, key=lambda x: x[0]),
                 "notes": sorted(
                     d["notes"],
                     key=lambda item: ((item.get("date") or ""), (item.get("type") or "")),

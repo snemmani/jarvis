@@ -23,63 +23,90 @@ _EARNINGS_WARN_DAYS = 7     # days before earnings to warn
 _52W_LOW_BUFFER_PCT = 5.0   # % above 52-week low to flag
 
 
+def _transaction_sort_key(tx: Dict) -> tuple[str, int]:
+    date_str = str(tx.get("Date") or "")[:10]
+    try:
+        row_id = int(tx.get("Id") or 0)
+    except (TypeError, ValueError):
+        row_id = 0
+    return date_str, row_id
+
+
+def _parse_number(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = str(value).replace(",", "").replace("₹", "").replace("$", "").strip()
+    try:
+        return float(cleaned) if cleaned else 0.0
+    except ValueError:
+        return 0.0
+
+
 def _compute_open_positions(transactions: List[Dict]) -> Dict[str, Dict]:
-    """Aggregate transactions into open positions keyed by ticker."""
+    """Aggregate transactions into open positions keyed by ticker.
+
+    Sells consume existing buy lots chronologically, so fully closed positions do
+    not pollute the average cost, oldest buy date, or thesis note of a later
+    re-entry in the same ticker.
+    """
     data: Dict[str, Dict] = {}
 
-    for tx in transactions:
-        ticker = (tx.get("Ticker") or "").strip()
-        tx_type = (tx.get("TransactionType") or "").strip()
-        shares = float(tx.get("NoOfShares") or 0)
-        cost = float(tx.get("CostPerShare") or 0)
-        cmp = float(tx.get("CMP") or 0)
-        date_str = (tx.get("Date") or "")[:10]
+    for tx in sorted(transactions or [], key=_transaction_sort_key):
+        ticker = (tx.get("Ticker") or "").strip().upper()
+        tx_type = (tx.get("TransactionType") or "").strip().lower()
+        shares = _parse_number(tx.get("NoOfShares"))
+        cost = _parse_number(tx.get("CostPerShare"))
+        cmp = _parse_number(tx.get("CMP"))
+        date_str = str(tx.get("Date") or "")[:10]
+        note = (tx.get("Note") or "").strip()
 
-        if not ticker or ticker.upper() == "CASH" or shares == 0:
+        if not ticker or ticker == "CASH" or shares <= 0:
             continue
 
-        if ticker not in data:
-            data[ticker] = {
-                "total_bought": 0.0,
-                "total_sold": 0.0,
-                "buy_cost": 0.0,
-                "cmp": 0.0,
-                "buy_dates": [],
-                "note": "",
-            }
-
+        pos = data.setdefault(ticker, {"cmp": 0.0, "lots": []})
         if cmp:
-            data[ticker]["cmp"] = cmp
+            pos["cmp"] = cmp
 
-        note = (tx.get("Note") or "").strip()
-        if note:
-            data[ticker]["note"] = note
-
-        if tx_type == "Buy":
-            data[ticker]["total_bought"] += shares
-            data[ticker]["buy_cost"] += shares * cost
+        if tx_type == "buy":
+            buy_date = None
             if date_str:
                 try:
-                    data[ticker]["buy_dates"].append(
-                        datetime.strptime(date_str, "%Y-%m-%d").date()
-                    )
+                    buy_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                 except ValueError:
-                    pass
-        elif tx_type == "Sell":
-            data[ticker]["total_sold"] += shares
+                    buy_date = None
+            pos["lots"].append({
+                "shares": shares,
+                "cost": cost,
+                "date": buy_date,
+                "note": note,
+            })
+        elif tx_type == "sell":
+            remaining_to_sell = shares
+            while remaining_to_sell > 1e-9 and pos["lots"]:
+                lot = pos["lots"][0]
+                consumed = min(remaining_to_sell, lot["shares"])
+                lot["shares"] -= consumed
+                remaining_to_sell -= consumed
+                if lot["shares"] <= 1e-9:
+                    pos["lots"].pop(0)
 
     open_positions = {}
     for ticker, d in data.items():
-        net_shares = d["total_bought"] - d["total_sold"]
+        lots = [lot for lot in d["lots"] if lot["shares"] > 1e-9]
+        net_shares = sum(lot["shares"] for lot in lots)
         if net_shares <= 0:
             continue
-        avg_cost = d["buy_cost"] / d["total_bought"] if d["total_bought"] else 0.0
+        open_cost = sum(lot["shares"] * lot["cost"] for lot in lots)
+        buy_dates = [lot["date"] for lot in lots if lot.get("date")]
+        notes = [lot["note"] for lot in lots if lot.get("note")]
         open_positions[ticker] = {
             "net_shares": net_shares,
-            "avg_cost": avg_cost,
+            "avg_cost": open_cost / net_shares if net_shares else 0.0,
             "cmp": d["cmp"],
-            "oldest_buy_date": min(d["buy_dates"]) if d["buy_dates"] else None,
-            "note": d.get("note", ""),
+            "oldest_buy_date": min(buy_dates) if buy_dates else None,
+            "note": notes[-1] if notes else "",
         }
 
     return open_positions

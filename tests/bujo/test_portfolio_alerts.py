@@ -228,6 +228,35 @@ class TestComputeOpenPositionsNote(unittest.TestCase):
         positions = _compute_open_positions(txs)
         self.assertEqual(positions["HDFCBANK.NS"]["note"], "Updated thesis: trim if NIM < 9%.")
 
+    def test_closed_lot_does_not_pollute_reentry_average_cost(self):
+        txs = [
+            {
+                "Id": 1, "Ticker": "TCS.NS", "Date": "2025-10-31",
+                "TransactionType": "Sell", "NoOfShares": 10,
+                "CostPerShare": 3061.30, "CMP": 2151.00, "Portfolio": "Ishaan",
+            },
+            {
+                "Id": 2, "Ticker": "TCS.NS", "Date": "2024-06-10",
+                "TransactionType": "Buy", "NoOfShares": 10,
+                "CostPerShare": 3860.00, "CMP": 2151.00, "Portfolio": "Ishaan",
+                "Note": "Old closed thesis.",
+            },
+            {
+                "Id": 3, "Ticker": "TCS.NS", "Date": "2026-06-09",
+                "TransactionType": "Buy", "NoOfShares": 6,
+                "CostPerShare": 2135.30, "CMP": 2151.00, "Portfolio": "Ishaan",
+                "Note": "Fresh entry thesis.",
+            },
+        ]
+
+        positions = _compute_open_positions(txs)
+        pos = positions["TCS.NS"]
+
+        self.assertEqual(pos["net_shares"], 6)
+        self.assertAlmostEqual(pos["avg_cost"], 2135.30)
+        self.assertEqual(pos["note"], "Fresh entry thesis.")
+        self.assertEqual(pos["oldest_buy_date"].isoformat(), "2026-06-09")
+
     def test_sell_transaction_note_ignored_when_earlier_buy_note_exists(self):
         txs = [
             {

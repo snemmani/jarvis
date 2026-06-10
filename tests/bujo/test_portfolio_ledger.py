@@ -36,6 +36,20 @@ class TestPortfolioLedger(unittest.TestCase):
         self.assertEqual(closed["sell_inr"], 7000)
         self.assertEqual(closed["realised_pl"], 1000)
 
+    def test_closed_lot_does_not_pollute_reentry_average_cost(self):
+        ledger = build_portfolio_ledger([
+            {"Id": 1, "Ticker": "TCS.NS", "Date": "2025-10-31", "TransactionType": "Sell", "NoOfShares": 10, "CostPerShare": 3061.30, "CMP": 2151, "Portfolio": "Ishaan"},
+            {"Id": 2, "Ticker": "TCS.NS", "Date": "2024-06-10", "TransactionType": "Buy", "NoOfShares": 10, "CostPerShare": 3860, "CMP": 2151, "Portfolio": "Ishaan"},
+            {"Id": 3, "Ticker": "TCS.NS", "Date": "2026-06-09", "TransactionType": "Buy", "NoOfShares": 6, "CostPerShare": 2135.30, "CMP": 2151, "Portfolio": "Ishaan"},
+        ])
+
+        holding = ledger["portfolios"]["Ishaan"]["holdings"][0]
+
+        self.assertEqual(holding["net_shares"], 6)
+        self.assertAlmostEqual(holding["avg_cost_inr"], 2135.30)
+        self.assertAlmostEqual(holding["invested_inr"], 12811.80)
+        self.assertAlmostEqual(holding["unrealised_pct"], 0.735256, places=5)
+
     def test_cash_rows_use_explicit_cash_ledger_only(self):
         ledger = build_portfolio_ledger([
             {"Ticker": "CASH", "TransactionType": "Deposit", "NoOfShares": 1, "CostPerShare": 10000, "Portfolio": "Core"},
@@ -65,6 +79,21 @@ class TestPortfolioLedger(unittest.TestCase):
 
         self.assertEqual(ledger["portfolios"]["Core"]["holdings"], [])
         self.assertTrue(any("Oversold SBIN.NS" in warning for warning in ledger["warnings"]))
+
+    def test_rebalance_helper_uses_only_open_lots_after_reentry(self):
+        positions = compute_positions_by_portfolio([
+            {"Id": 1, "Ticker": "TCS.NS", "Date": "2025-10-31", "TransactionType": "Sell", "NoOfShares": 10, "CostPerShare": 3061.30, "Portfolio": "Ishaan"},
+            {"Id": 2, "Ticker": "TCS.NS", "Date": "2024-06-10", "TransactionType": "Buy", "NoOfShares": 10, "CostPerShare": 3860, "Portfolio": "Ishaan"},
+            {"Id": 3, "Ticker": "TCS.NS", "Date": "2026-06-09", "TransactionType": "Buy", "NoOfShares": 6, "CostPerShare": 2135.30, "Portfolio": "Ishaan"},
+        ])
+
+        pos = positions["Ishaan"]["TCS.NS"]
+
+        self.assertEqual(pos["net_shares"], 6)
+        self.assertAlmostEqual(pos["avg_cost"], 2135.30)
+        self.assertAlmostEqual(pos["total_invested"], 12811.80)
+        self.assertEqual(pos["buy_dates"], ["2026-06-09"])
+        self.assertEqual(pos["all_buy_lots"], [("2026-06-09", 6, 2135.30)])
 
     def test_rebalance_helpers_share_normalisation(self):
         txs = [

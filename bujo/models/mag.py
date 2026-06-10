@@ -3,7 +3,7 @@ import logging
 import requests
 from typing import Any, Dict, List, Optional
 
-from bujo.models.base import BaseNocoDB
+from bujo.models.base import BaseNocoDB, nocodb_where_from_tool_input
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +30,10 @@ class MAG(BaseNocoDB):
         return "Updating MAG failed. Try again?"
 
     def list(self, where: Optional[str] = None, sort: Optional[str] = None) -> List[Dict[str, Any]]:
-        parsed = json.loads(where.replace("```json", "").replace("```", "")) if where else {}
-        filters = parsed.get("filters")
+        where_clause = nocodb_where_from_tool_input(where)
         params: Dict[str, Any] = {}
-        if filters:
-            params["where"] = filters
+        if where_clause:
+            params["where"] = where_clause
         if sort:
             params["sort"] = sort
         return self._paginated_list(params)

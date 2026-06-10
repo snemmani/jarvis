@@ -97,6 +97,31 @@ class TestMAG(unittest.TestCase):
             params={"limit": 1000, "offset": 0},
         )
 
+
+    @patch("requests.get")
+    def test_list_joins_filter_arrays_with_nocodb_and(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.json.return_value = {"list": []}
+        mock_get.return_value = mock_response
+
+        self.mag.list(json.dumps({
+            "filters": [
+                "(Date,ge,exactDate,2026-06-09)",
+                "(Date,lt,exactDate,2026-06-10)",
+            ]
+        }))
+
+        mock_get.assert_called_once_with(
+            f"{self.base_url}/api/v2/tables/{self.mag_table_id}/records",
+            headers=self.mag.headers,
+            params={
+                "where": "(Date,ge,exactDate,2026-06-09)~and(Date,lt,exactDate,2026-06-10)",
+                "limit": 1000,
+                "offset": 0,
+            },
+        )
+
     @patch("requests.get")
     def test_find_by_date_success(self, mock_get):
         mock_response = MagicMock()

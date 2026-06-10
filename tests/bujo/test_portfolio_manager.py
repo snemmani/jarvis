@@ -51,7 +51,36 @@ fake_prebuilt = types.ModuleType("langgraph.prebuilt")
 fake_prebuilt.create_react_agent = MagicMock()
 sys.modules.setdefault("langgraph.prebuilt", fake_prebuilt)
 
+from bujo.models.portfolio_transactions import PortfolioTransactions
 from bujo.portoflio.manage import PortfolioManager
+
+
+
+class TestPortfolioTransactionsModel(unittest.TestCase):
+    @patch("requests.get")
+    def test_list_joins_date_range_filters_with_nocodb_and(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.json.return_value = {"list": []}
+        mock_get.return_value = mock_response
+        model = PortfolioTransactions("https://example.com", "token", "transactions")
+
+        model.list(json.dumps({
+            "filters": [
+                "(Date,ge,exactDate,2026-06-09)",
+                "(Date,lt,exactDate,2026-06-10)",
+            ]
+        }))
+
+        mock_get.assert_called_once_with(
+            "https://example.com/api/v2/tables/transactions/records",
+            headers=model.headers,
+            params={
+                "where": "(Date,ge,exactDate,2026-06-09)~and(Date,lt,exactDate,2026-06-10)",
+                "limit": 1000,
+                "offset": 0,
+            },
+        )
 
 
 class TestPortfolioManager(unittest.TestCase):
